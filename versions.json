@@ -1,6 +1,12 @@
 {
-  "latest": "v16",
+  "latest": "v28",
   "versions": [
+    {
+      "tag": "v28",
+      "date": "2026-11-26",
+      "note": "미니 영상 미리보기, 전체화면 집중 모드(채팅 너비 드래그 조절), 네이버 쿠키 설정 및 서랍형 우측 툴바 추가",
+      "url": "https://github.com/SiwonH/chzzk-multiview-chat/releases/download/v28/chzzk_chat.py"
+    },
     {
       "tag": "v16",
       "date": "2026-11-26",
