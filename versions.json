@@ -1,6 +1,12 @@
 {
-  "latest": "v29",
+  "latest": "v30",
   "versions": [
+    {
+      "tag": "v30",
+      "date": "2026-11-26",
+      "note": "수동 버전 선택 시 버전 고정(chzzk_update.json) 및 v 메뉴 자동 업데이트 토글(a) 추가",
+      "url": "https://github.com/SiwonH/chzzk-multiview-chat/releases/download/v30/chzzk_chat.py"
+    },
     {
       "tag": "v29",
       "date": "2026-11-26",
