@@ -1,6 +1,12 @@
 {
-  "latest": "v30",
+  "latest": "v34",
   "versions": [
+    {
+      "tag": "v34",
+      "date": "2026-11-26",
+      "note": "전체 마스터 볼륨·방송별 개별 볼륨 조절(기본 50%) 및 좌측 하단 볼륨 컨트롤 배치",
+      "url": "https://github.com/SiwonH/chzzk-multiview-chat/releases/download/v34/chzzk_chat.py"
+    },
     {
       "tag": "v30",
       "date": "2026-11-26",
