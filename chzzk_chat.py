@@ -11,7 +11,7 @@ import webbrowser
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-APP_VERSION = "v16"
+APP_VERSION = "v28"
 GITHUB_REPO = "SiwonH/chzzk-multiview-chat"
 GITHUB_ASSET_NAME = "chzzk_chat.py"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=15"
@@ -24,6 +24,7 @@ GITHUB_HEADERS = {
 
 SEARCH_URL = "https://api.chzzk.naver.com/service/v1/search/channels"
 CHANNEL_INFO_URL = "https://api.chzzk.naver.com/service/v1/channels/{}"
+LIVE_DETAIL_URL = "https://api.chzzk.naver.com/service/v3/channels/{}/live-detail"
 STATUS_URL = "https://api.chzzk.naver.com/polling/v2/channels/{}/live-status"
 TOKEN_URL = "https://comm-api.game.naver.com/nng_main/v1/chats/access-token?channelId={}&chatType=STREAMING"
 
@@ -38,9 +39,53 @@ HEADERS = {
 }
 
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chzzk_history.json")
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chzzk_cookies.json")
 MAX_HISTORY = 9
 history_lock = threading.Lock()
+cookie_lock = threading.Lock()
 INITIAL_CHANNELS = []
+
+def load_cookies():
+    """저장된 네이버 로그인 쿠키(NID_AUT, NID_SES)를 불러옵니다."""
+    with cookie_lock:
+        if not os.path.exists(COOKIES_FILE):
+            return {"NID_AUT": "", "NID_SES": ""}
+        try:
+            with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"NID_AUT": "", "NID_SES": ""}
+            return {
+                "NID_AUT": str(data.get("NID_AUT") or "").strip(),
+                "NID_SES": str(data.get("NID_SES") or "").strip(),
+            }
+        except Exception:
+            return {"NID_AUT": "", "NID_SES": ""}
+
+def save_cookies(nid_aut, nid_ses):
+    """네이버 로그인 쿠키를 로컬 JSON 파일에 저장합니다."""
+    cleaned = {
+        "NID_AUT": str(nid_aut or "").strip(),
+        "NID_SES": str(nid_ses or "").strip(),
+    }
+    with cookie_lock:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+
+def clear_cookies():
+    """저장된 쿠키 파일을 삭제합니다."""
+    with cookie_lock:
+        if os.path.exists(COOKIES_FILE):
+            os.remove(COOKIES_FILE)
+
+def get_cookie_status():
+    """프론트/CLI 표시용 쿠키 설정 여부 요약을 반환합니다."""
+    cookies = load_cookies()
+    aut = cookies.get("NID_AUT", "")
+    ses = cookies.get("NID_SES", "")
+    has_cookie = bool(aut and ses)
+    preview = (aut[:4] + "****" + aut[-4:]) if len(aut) > 8 else ("설정됨" if aut else "")
+    return {"hasCookie": has_cookie, "nidAutPreview": preview}
 
 def sanitize_channels(channels):
     """채널 목록에서 중복과 잘못된 항목을 정리해 최대 6개까지 반환합니다."""
@@ -100,8 +145,18 @@ def record_history_entry(channels):
     filtered = [entry for entry in history if tuple(ch["id"] for ch in entry) != key]
     save_history([cleaned] + filtered)
 
-def request_json(url):
-    req = urllib.request.Request(url, headers=HEADERS)
+def request_json(url, use_cookies=False):
+    headers = dict(HEADERS)
+    if use_cookies:
+        cookies = load_cookies()
+        parts = []
+        if cookies.get("NID_AUT"):
+            parts.append(f"NID_AUT={cookies['NID_AUT']}")
+        if cookies.get("NID_SES"):
+            parts.append(f"NID_SES={cookies['NID_SES']}")
+        if parts:
+            headers["Cookie"] = "; ".join(parts)
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as res:
         return json.load(res)
 
@@ -133,7 +188,7 @@ def parse_channel_summary(ch):
 def get_channel_by_id(channel_id):
     """채널 ID로 단일 채널 정보를 직접 조회합니다."""
     try:
-        data = request_json(CHANNEL_INFO_URL.format(channel_id))
+        data = request_json(CHANNEL_INFO_URL.format(channel_id), use_cookies=True)
         return parse_channel_summary(data.get("content"))
     except Exception:
         return None
@@ -148,7 +203,7 @@ def search_channels(keyword, size=6):
         return [ch] if ch else []
     try:
         q = urllib.parse.urlencode({"keyword": keyword, "offset": 0, "size": size})
-        data = request_json(f"{SEARCH_URL}?{q}")
+        data = request_json(f"{SEARCH_URL}?{q}", use_cookies=True)
         rows = data.get("content", {}).get("data", [])
         results = []
         for row in rows:
@@ -172,7 +227,7 @@ def find_channel_id(keyword):
 def get_live_status(channel_id):
     """방종 상태에서 방송 시작 여부만 1회 호출로 가볍게 확인합니다."""
     try:
-        status_data = request_json(STATUS_URL.format(channel_id))
+        status_data = request_json(STATUS_URL.format(channel_id), use_cookies=True)
         content = status_data.get("content") or {}
         return {
             "chatChannelId": content.get("chatChannelId"),
@@ -184,7 +239,7 @@ def get_live_status(channel_id):
 def get_chat_credentials(channel_id):
     """채널 ID로 chatChannelId와 읽기 전용 accessToken을 발급받습니다."""
     try:
-        status_data = request_json(STATUS_URL.format(channel_id))
+        status_data = request_json(STATUS_URL.format(channel_id), use_cookies=True)
         content = status_data.get("content") or {}
         chat_channel_id = content.get("chatChannelId")
         live_status = content.get("status", "UNKNOWN")
@@ -192,7 +247,7 @@ def get_chat_credentials(channel_id):
         if not chat_channel_id:
             return {"error": "채팅 채널 ID를 찾을 수 없습니다."}
 
-        token_data = request_json(TOKEN_URL.format(chat_channel_id))
+        token_data = request_json(TOKEN_URL.format(chat_channel_id), use_cookies=True)
         access_token = (token_data.get("content") or {}).get("accessToken")
 
         if not access_token:
@@ -202,6 +257,58 @@ def get_chat_credentials(channel_id):
             "chatChannelId": chat_channel_id,
             "accessToken": access_token,
             "status": live_status
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_stream_info(channel_id):
+    """채널 ID로 방송 상세 정보와 저지연 LLHLS(또는 HLS) 스트림 URL을 조회합니다."""
+    try:
+        detail_data = request_json(LIVE_DETAIL_URL.format(channel_id), use_cookies=True)
+        content = detail_data.get("content") or {}
+        status = content.get("status", "UNKNOWN")
+        title = content.get("liveTitle") or ""
+        category = content.get("liveCategoryValue") or ""
+        user_count = int(content.get("concurrentUserCount") or 0)
+        adult = bool(content.get("adult", False))
+
+        if status != "OPEN":
+            return {"status": status, "error": "현재 방송 중이 아닙니다."}
+
+        playback_raw = content.get("livePlaybackJson")
+        if not playback_raw:
+            msg = "성인 인증이 필요한 방송입니다. (🔑 쿠키 설정 필요)" if adult else "재생 가능한 스트림 주소를 찾지 못했습니다."
+            return {"status": status, "error": msg}
+
+        playback = json.loads(playback_raw) if isinstance(playback_raw, str) else playback_raw
+        media_list = (playback or {}).get("media") or []
+
+        llhls_url = None
+        hls_url = None
+        for m in media_list:
+            mid = m.get("mediaId")
+            path = m.get("path")
+            if not path:
+                continue
+            if mid == "LLHLS" and not llhls_url:
+                llhls_url = path
+            elif mid == "HLS" and not hls_url:
+                hls_url = path
+            elif m.get("protocol") == "HLS" and not hls_url:
+                hls_url = path
+
+        primary_url = llhls_url or hls_url
+        if not primary_url:
+            return {"status": status, "error": "HLS 스트림 주소를 찾지 못했습니다."}
+
+        return {
+            "status": status,
+            "title": title,
+            "category": category,
+            "userCount": user_count,
+            "hlsUrl": primary_url,
+            "hlsFallbackUrl": hls_url if (llhls_url and hls_url and hls_url != llhls_url) else None,
+            "isLowLatency": bool(llhls_url),
         }
     except Exception as e:
         return {"error": str(e)}
@@ -272,7 +379,230 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background-color: rgba(0, 255, 163, 0.1);
         }
         .header-controls { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
-        .global-header-tools { display: inline-flex; align-items: center; gap: 3px; margin-right: 2px; }
+        .global-header-tools {
+            position: fixed;
+            top: 58px;
+            right: 0;
+            z-index: 90;
+            display: inline-flex;
+            flex-direction: row;
+            align-items: stretch;
+            height: 85px;
+            box-sizing: border-box;
+            padding: 0;
+            border-radius: 10px 0 0 10px;
+            background: rgba(20, 20, 28, 0.95);
+            border: 1px solid rgba(0, 255, 163, 0.45);
+            border-right: none;
+            box-shadow: -4px 6px 18px rgba(0, 0, 0, 0.68);
+            transition: background-color 0.2s, border-color 0.2s, box-shadow 0.2s;
+        }
+        .global-header-tools.is-collapsed {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+        }
+        .global-header-tools:not(.is-collapsed):hover,
+        .global-header-tools:not(.is-collapsed):focus-within,
+        .global-header-tools.intro-spotlight {
+            background: rgba(22, 22, 30, 0.98);
+            border-color: #00ffa3;
+            box-shadow: -4px 8px 24px rgba(0, 0, 0, 0.78);
+        }
+        .global-header-tools.intro-spotlight {
+            animation: toolsIntroPulse 1.4s ease-out 3;
+        }
+        @keyframes toolsIntroPulse {
+            0% { box-shadow: 0 0 0 0 rgba(0, 255, 163, 0.6), -4px 8px 24px rgba(0, 0, 0, 0.78); }
+            70% { box-shadow: 0 0 0 10px rgba(0, 255, 163, 0), -4px 8px 24px rgba(0, 0, 0, 0.78); }
+            100% { box-shadow: 0 0 0 0 rgba(0, 255, 163, 0), -4px 8px 24px rgba(0, 0, 0, 0.78); }
+        }
+        .global-tools-expanded {
+            display: inline-flex;
+            align-items: stretch;
+            height: 100%;
+        }
+        .global-tools-inner {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 5px;
+            padding: 5px 7px;
+            height: 100%;
+            box-sizing: border-box;
+        }
+        .global-tools-section {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 4px;
+            padding: 3px 4px;
+            border-radius: 7px;
+            background: rgba(255, 255, 255, 0.035);
+            border: 1px solid rgba(255, 255, 255, 0.09);
+            box-sizing: border-box;
+        }
+        .global-header-tools.is-collapsed .global-tools-expanded {
+            display: none;
+        }
+        .btn-tools-handle {
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            line-height: 1;
+            cursor: pointer;
+            transition: width 0.16s ease-out, min-width 0.16s ease-out, opacity 0.16s, background-color 0.16s, border-color 0.16s, color 0.16s, box-shadow 0.16s;
+        }
+        .btn-tools-expand-tab {
+            display: none;
+            width: 10px;
+            min-width: 10px;
+            height: 85px;
+            box-sizing: border-box;
+            border-radius: 8px 0 0 8px;
+            background: rgba(22, 22, 30, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-right: none;
+            color: rgba(212, 212, 216, 0.75);
+            font-size: 9px;
+            opacity: 0.45;
+            box-shadow: none;
+        }
+        .btn-tools-expand-tab:hover,
+        .btn-tools-expand-tab.near-hover {
+            width: 24px;
+            min-width: 24px;
+            opacity: 1;
+            background: rgba(24, 26, 36, 0.98);
+            border-color: #00ffa3;
+            color: #00ffa3;
+            font-size: 11px;
+            box-shadow: -3px 4px 12px rgba(0, 0, 0, 0.6);
+        }
+        .global-header-tools.is-collapsed .btn-tools-expand-tab {
+            display: inline-flex;
+        }
+        .btn-tools-collapse-tab {
+            width: 14px;
+            min-width: 14px;
+            height: 100%;
+            font-size: 10px;
+            border-radius: 9px 0 0 9px;
+            background: rgba(255, 255, 255, 0.04);
+            border: none;
+            border-right: 1px solid rgba(255, 255, 255, 0.14);
+            color: #a1a1aa;
+        }
+        .btn-tools-collapse-tab:hover {
+            width: 18px;
+            min-width: 18px;
+            background: rgba(0, 255, 163, 0.18);
+            color: #00ffa3;
+        }
+        .global-header-tools .btn-mini {
+            height: 26px;
+            min-width: 26px;
+            padding: 0 6px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12.5px;
+            border-radius: 5px;
+            background: #2a2a34;
+            border-color: #3f3f4e;
+            color: #f4f4f6;
+            transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+        }
+        .global-header-tools .btn-mini.btn-tools-primary {
+            color: #00ffa3;
+            border-color: rgba(0, 255, 163, 0.52);
+            padding: 0 8px;
+            gap: 4px;
+            font-weight: 600;
+        }
+        .global-header-tools .btn-mini:hover {
+            background: #353542;
+            border-color: #00ffa3;
+            color: #00ffa3;
+        }
+        .global-header-tools .font-indicator {
+            font-size: 13px;
+            min-width: 24px;
+            text-align: center;
+            color: #f4f4f6;
+            user-select: none;
+        }
+        .global-tools-hint {
+            position: absolute;
+            top: calc(100% + 12px);
+            right: 12px;
+            width: 286px;
+            background: rgba(16, 18, 24, 0.98);
+            color: #e4e4e7;
+            border: 2px solid #00ffa3;
+            border-radius: 12px;
+            padding: 13px 15px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.85), 0 0 18px rgba(0, 255, 163, 0.25);
+            pointer-events: none;
+            opacity: 0;
+            transform: translateY(-6px);
+            transition: opacity 0.28s, transform 0.28s;
+            cursor: pointer;
+        }
+        .global-tools-hint::before {
+            content: "";
+            position: absolute;
+            top: -8px;
+            right: 22px;
+            width: 12px;
+            height: 12px;
+            background: rgba(16, 18, 24, 0.98);
+            border-left: 2px solid #00ffa3;
+            border-top: 2px solid #00ffa3;
+            transform: rotate(45deg);
+        }
+        .global-tools-hint-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 14px;
+            font-weight: 800;
+            color: #00ffa3;
+        }
+        .global-tools-hint-close {
+            background: rgba(255, 255, 255, 0.08);
+            color: #d4d4d8;
+            border: 1px solid #3f3f4e;
+            border-radius: 5px;
+            padding: 1px 6px;
+            font-size: 12px;
+            line-height: 1.3;
+            cursor: pointer;
+        }
+        .global-tools-hint-close:hover {
+            border-color: #00ffa3;
+            color: #00ffa3;
+        }
+        .global-tools-hint-body {
+            margin-top: 6px;
+            font-size: 12.5px;
+            line-height: 1.5;
+            color: #f4f4f6;
+        }
+        .global-tools-hint-sub {
+            margin-top: 5px;
+            font-size: 11.5px;
+            line-height: 1.4;
+            color: #9ca3af;
+        }
+        .global-header-tools.intro-spotlight .global-tools-hint {
+            opacity: 1;
+            transform: translateY(0);
+            pointer-events: auto;
+        }
         .status-dot {
             width: 7px; height: 7px; border-radius: 50%; background-color: #666;
             margin: 0 2px; flex-shrink: 0;
@@ -292,14 +622,151 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .btn-mini:hover { background: #32323c; color: #00ffa3; border-color: #00ffa3; }
         .btn-close-col:hover { color: #ff6b6b; border-color: #ff6b6b; }
 
-        /* 스트리머/매니저 칸 토글 버튼 상태 */
+        /* 스트리머/매니저 칸 & 미니 영상 토글 버튼 상태 */
         .btn-pin-toggle { position: relative; }
-        .btn-pin-toggle.active {
+        .btn-pin-toggle.active,
+        .btn-video-toggle.active {
             border-color: rgba(0, 255, 163, 0.5);
             color: #00ffa3;
             background: rgba(0, 255, 163, 0.08);
         }
         .btn-pin-toggle.muted { opacity: 0.5; }
+
+        /* 상단 미니 스트리밍 플레이어 */
+        .video-panel {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            max-height: 42vh;
+            background-color: #000;
+            flex-shrink: 0;
+            overflow: hidden;
+            border-bottom: 1px solid #222228;
+        }
+        .video-panel.hidden { display: none !important; }
+        .video-player {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+            background-color: #000;
+        }
+        .video-msg {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px;
+            text-align: center;
+            font-size: 12px;
+            color: #a1a1aa;
+            background: rgba(11, 11, 14, 0.85);
+            pointer-events: none;
+        }
+        .video-msg.hidden { display: none; }
+        .video-overlay {
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            padding: 14px 8px 6px;
+            background: linear-gradient(transparent, rgba(0, 0, 0, 0.84));
+            opacity: 0;
+            transition: opacity 0.15s;
+        }
+        .video-panel:hover .video-overlay { opacity: 1; }
+        .video-info-badge {
+            font-size: 10px;
+            color: #e4e4e7;
+            background: rgba(20, 20, 26, 0.8);
+            border: 1px solid #34343f;
+            border-radius: 4px;
+            padding: 2px 6px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 55%;
+        }
+        .video-overlay-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+        .btn-video-ctrl {
+            background: rgba(24, 24, 30, 0.9);
+            color: #e4e4e7;
+            border: 1px solid #3f3f4a;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 11px;
+            cursor: pointer;
+            line-height: 1.3;
+        }
+        .btn-video-ctrl:hover { border-color: #00ffa3; color: #00ffa3; }
+
+        .col-body {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .chat-pane {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        /* 더블클릭 전체화면 집중 모드 (큰 영상 + 해당 방송 채팅) */
+        body.focus-mode .wrapper {
+            display: flex;
+        }
+        body.focus-mode .chat-box:not(.is-focused) {
+            display: none !important;
+        }
+        body.focus-mode .chat-box.is-focused {
+            flex: 1 1 auto;
+            width: 100vw;
+            height: 100vh;
+            border-right: none;
+        }
+        body.focus-mode .chat-box.is-focused .col-body {
+            flex-direction: row;
+        }
+        body.focus-mode .chat-box.is-focused .video-panel {
+            flex: 1 1 auto;
+            width: auto;
+            height: 100%;
+            max-height: none;
+            aspect-ratio: auto;
+            border-bottom: none;
+            border-right: none;
+        }
+        .focus-resizer {
+            display: none;
+            width: 5px;
+            background-color: #1f222e;
+            border-left: 1px solid #2b2f40;
+            border-right: 1px solid #2b2f40;
+            cursor: ew-resize;
+            flex-shrink: 0;
+            transition: background-color 0.15s;
+        }
+        body.focus-mode .chat-box.is-focused .focus-resizer {
+            display: block;
+        }
+        .focus-resizer:hover, .focus-resizer.dragging {
+            background-color: #00ffa3;
+        }
+        body.focus-mode .chat-box.is-focused .chat-pane {
+            flex: 0 0 var(--focus-chat-width, clamp(250px, 18vw, 330px));
+            height: 100%;
+        }
         .btn-pin-toggle.has-new {
             opacity: 1;
             background-color: rgba(0, 255, 163, 0.24);
@@ -585,18 +1052,88 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             padding: 6px 10px; border-radius: 6px; font-size: 13px;
         }
         .active-item-actions { display: flex; gap: 4px; }
+
+        .global-header-tools .btn-mini.btn-cookie.active,
+        .btn-cookie.active {
+            border-color: rgba(0, 255, 163, 0.55);
+            color: #00ffa3;
+            background: rgba(0, 255, 163, 0.14);
+        }
+        .global-header-tools:hover .btn-mini.btn-cookie.active,
+        .global-header-tools.intro-spotlight .btn-mini.btn-cookie.active {
+            border-color: rgba(0, 255, 163, 0.65);
+            color: #00ffa3;
+            background: rgba(0, 255, 163, 0.14);
+        }
+        .cookie-guide {
+            font-size: 12px;
+            color: #a1a1aa;
+            background: #121218;
+            border: 1px solid #262630;
+            border-radius: 6px;
+            padding: 10px 12px;
+            line-height: 1.55;
+            margin-bottom: 12px;
+        }
+        .cookie-field { margin-bottom: 10px; }
+        .cookie-label {
+            display: block;
+            font-size: 12px;
+            font-weight: bold;
+            color: #d4d4d8;
+            margin-bottom: 4px;
+        }
+        .cookie-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .btn-secondary {
+            background: #23232a;
+            color: #d4d4d8;
+            border: 1px solid #34343f;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .btn-secondary:hover { border-color: #ff6b6b; color: #ff6b6b; }
     </style>
 </head>
 <body>
     <div class="wrapper" id="wrapper"></div>
 
     <!-- 전역 컨트롤 묶음 -->
-    <span class="global-header-tools" id="global-tools">
-        <button class="btn-mini" id="btn-font-down" title="글자 작게 (-)">-</button>
-        <span class="font-indicator" id="font-size-val">20</span>
-        <button class="btn-mini" id="btn-font-up" title="글자 크게 (+)">+</button>
-        <button class="btn-mini" id="btn-manage-streamers" title="스트리머 추가 및 편성 관리 (E)">⚙</button>
-    </span>
+    <div class="global-header-tools" id="global-tools">
+        <button type="button" class="btn-tools-handle btn-tools-expand-tab" id="btn-tools-expand" title="설정 · 글자크기 툴바 펼치기">◀</button>
+        <div class="global-tools-expanded" id="global-tools-expanded">
+            <button type="button" class="btn-tools-handle btn-tools-collapse-tab" id="btn-tools-collapse" title="툴바 접기">▶</button>
+            <div class="global-tools-inner">
+                <div class="global-tools-section" aria-label="관리 및 인증">
+                    <button class="btn-mini btn-tools-primary" id="btn-manage-streamers" title="스트리머 추가 및 편성 관리 (E)">⚙ 설정</button>
+                    <button class="btn-mini btn-cookie" id="btn-cookie-settings" title="네이버 로그인 쿠키 설정 (성인 인증 방송용)">🔑</button>
+                </div>
+                <div class="global-tools-section" aria-label="글자 크기 조절">
+                    <button class="btn-mini" id="btn-font-down" title="글자 작게 (-)">-</button>
+                    <span class="font-indicator" id="font-size-val">20</span>
+                    <button class="btn-mini" id="btn-font-up" title="글자 크게 (+)">+</button>
+                </div>
+            </div>
+        </div>
+        <div class="global-tools-hint" id="global-tools-hint" title="클릭하면 닫히고 툴바가 접힙니다">
+            <div class="global-tools-hint-head">
+                <span>⚙ 설정 · 쿠키 · 글자크기 (E)</span>
+                <button type="button" class="global-tools-hint-close" id="btn-tools-hint-close" title="닫기">✕</button>
+            </div>
+            <div class="global-tools-hint-body">
+                스트리머 편성, 성인 인증 쿠키, 채팅 글자 크기를 여기서 바로 바꿀 수 있어요.
+            </div>
+            <div class="global-tools-hint-sub">
+                잠시 후 오른쪽 끝 얇은 <b>[◀]</b> 버튼으로 접히며, 눌러서 언제든 다시 펼칠 수 있습니다.
+            </div>
+        </div>
+    </div>
 
     <!-- 📌 우클릭 컨텍스트 메뉴 -->
     <div class="context-menu" id="pin-context-menu">
@@ -637,6 +1174,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="context-menu-item" id="hist-ctx-delete">
             <span>이 기록 삭제</span>
         </button>
+    </div>
+
+    <!-- 네이버 쿠키 설정 모달 -->
+    <div class="modal-backdrop" id="cookie-modal-backdrop">
+        <div class="modal-card">
+            <div class="modal-head">
+                <span class="modal-title">🔑 네이버 로그인 쿠키 설정</span>
+                <button class="modal-close" id="cookie-modal-close">×</button>
+            </div>
+            <div class="cookie-guide">
+                성인(19+) 방송 시청/채팅에 사용됩니다. (이 PC의 로컬 파일에만 저장)<br>
+                <b>chzzk.naver.com</b> 로그인 → <b>F12</b> → <b>Application</b> → <b>Cookies</b>에서<br>
+                <b>NID_AUT</b>와 <b>NID_SES</b> 값을 복사해 입력하세요.
+            </div>
+            <div class="search-status" id="cookie-status-txt">확인 중...</div>
+            <div class="cookie-field">
+                <label class="cookie-label" for="cookie-nid-aut">NID_AUT</label>
+                <input type="password" class="search-input" id="cookie-nid-aut" placeholder="NID_AUT 값 붙여넣기" autocomplete="off" style="width:100%">
+            </div>
+            <div class="cookie-field">
+                <label class="cookie-label" for="cookie-nid-ses">NID_SES</label>
+                <input type="password" class="search-input" id="cookie-nid-ses" placeholder="NID_SES 값 붙여넣기" autocomplete="off" style="width:100%">
+            </div>
+            <div class="cookie-actions">
+                <button type="button" class="btn-secondary" id="btn-cookie-clear">저장된 쿠키 삭제</button>
+                <button type="button" class="btn-primary" id="btn-cookie-save">저장</button>
+            </div>
+        </div>
     </div>
 
     <!-- 스트리머 검색/편집 모달 -->
@@ -772,13 +1337,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             if (histCtxTargetChannel) {
                 titleEl.textContent = `${histCtxTargetChannel.name} · 기록 #${comboIdx + 1}`;
-                pickOneLabel.textContent = modalMode === "replace" ? "이 스트리머로 교체" : "이 스트리머 추가";
+                pickOneLabel.textContent = "이 스트리머 추가";
                 pickOneBtn.style.display = "flex";
             } else {
                 titleEl.textContent = `최근 조합 #${comboIdx + 1}`;
                 pickOneBtn.style.display = "none";
             }
-            loadComboBtn.style.display = modalMode === "replace" ? "none" : "flex";
+            loadComboBtn.style.display = "flex";
 
             positionContextMenu(historyCtxMenuEl, e);
         }
@@ -862,6 +1427,158 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             closeHistoryContextMenu();
         });
 
+        let focusedClient = null;
+        let focusPrevFullscreen = false;
+        let focusSuspendedClients = [];
+        let focusPrevQuality = 360;
+        let focusPrevMuted = true;
+        let focusExiting = false;
+
+        function enterFocusMode(client) {
+            if (!client || client.isDestroyed) return;
+            if (focusedClient === client) return;
+            if (focusedClient) exitFocusMode(true);
+
+            focusedClient = client;
+            focusPrevFullscreen = !!document.fullscreenElement;
+            focusPrevQuality = client.preferredQuality;
+            focusPrevMuted = client.videoEl.muted;
+            focusSuspendedClients = [];
+
+            clientMap.forEach((other) => {
+                if (other !== client && other.isVideoOpen) {
+                    focusSuspendedClients.push(other);
+                    other.stopVideo();
+                }
+            });
+
+            if (!client.isVideoOpen) {
+                client.setVideoOpen(true);
+            }
+
+            document.body.classList.add("focus-mode");
+            client.container.classList.add("is-focused");
+            client.videoFocusBtn.textContent = "↩";
+            client.videoFocusBtn.title = "멀티뷰로 복귀 (더블클릭 / Esc)";
+
+            client.setVideoMuted(false);
+            client.preferredQuality = 0;
+            client.videoQualBtn.textContent = "원본";
+            client.applyPreferredVideoLevel();
+            client.snapToLiveEdge();
+            client.runWithAnchorPreserved(() => {});
+
+            if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+                document.documentElement.requestFullscreen().catch(() => {});
+            }
+        }
+
+        function exitFocusMode(skipFullscreenExit = false) {
+            if (!focusedClient || focusExiting) return;
+            focusExiting = true;
+
+            const target = focusedClient;
+            focusedClient = null;
+
+            document.body.classList.remove("focus-mode");
+            target.container.classList.remove("is-focused");
+            target.videoFocusBtn.textContent = "⤢";
+            target.videoFocusBtn.title = "전체화면 집중 모드 (더블클릭)";
+
+            target.setVideoMuted(focusPrevMuted);
+            target.preferredQuality = focusPrevQuality;
+            target.videoQualBtn.textContent = target.preferredQuality === 0 ? "원본" : `${target.preferredQuality}p`;
+            target.applyPreferredVideoLevel();
+
+            const toRestore = focusSuspendedClients;
+            focusSuspendedClients = [];
+            for (let i = 0; i < toRestore.length; i++) {
+                const other = toRestore[i];
+                if (!other.isDestroyed && other.isVideoOpen) {
+                    other.startVideo();
+                }
+            }
+
+            clientMap.forEach(c => c.runWithAnchorPreserved(() => {}));
+
+            if (!skipFullscreenExit && !focusPrevFullscreen && document.fullscreenElement && document.exitFullscreen) {
+                document.exitFullscreen().catch(() => {});
+            }
+            endFocusResize();
+            focusExiting = false;
+        }
+
+        const FOCUS_CHAT_WIDTH_KEY = "chzzk_focus_chat_width";
+        let activeFocusResizer = null;
+
+        function applyFocusChatWidth(px, persist = true) {
+            if (px == null) {
+                document.documentElement.style.removeProperty("--focus-chat-width");
+                if (persist) localStorage.removeItem(FOCUS_CHAT_WIDTH_KEY);
+                return;
+            }
+            const maxPx = Math.max(260, Math.min(560, Math.floor(window.innerWidth * 0.48)));
+            const clamped = Math.max(220, Math.min(maxPx, Math.round(px)));
+            document.documentElement.style.setProperty("--focus-chat-width", `${clamped}px`);
+            if (persist) localStorage.setItem(FOCUS_CHAT_WIDTH_KEY, String(clamped));
+        }
+
+        function endFocusResize() {
+            if (!activeFocusResizer) return;
+            activeFocusResizer.classList.remove("dragging");
+            activeFocusResizer = null;
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+        }
+
+        (function setupFocusResizer() {
+            const savedWidth = Number(localStorage.getItem(FOCUS_CHAT_WIDTH_KEY));
+            if (Number.isFinite(savedWidth) && savedWidth >= 220) {
+                applyFocusChatWidth(savedWidth, false);
+            }
+
+            document.addEventListener("mousedown", (e) => {
+                const resizer = e.target.closest(".focus-resizer");
+                if (!resizer || !focusedClient) return;
+                e.preventDefault();
+                activeFocusResizer = resizer;
+                resizer.classList.add("dragging");
+                document.body.style.cursor = "ew-resize";
+                document.body.style.userSelect = "none";
+            });
+
+            window.addEventListener("mousemove", (e) => {
+                if (!activeFocusResizer || !focusedClient) return;
+                const colBody = activeFocusResizer.parentElement;
+                if (!colBody) return;
+                const rect = colBody.getBoundingClientRect();
+                applyFocusChatWidth(rect.right - e.clientX, true);
+            });
+
+            window.addEventListener("mouseup", endFocusResize);
+            window.addEventListener("blur", endFocusResize);
+
+            document.addEventListener("dblclick", (e) => {
+                if (e.target.closest(".focus-resizer")) {
+                    applyFocusChatWidth(null, true);
+                }
+            });
+        })();
+
+        function toggleFocusMode(client) {
+            if (focusedClient === client) {
+                exitFocusMode();
+            } else {
+                enterFocusMode(client);
+            }
+        }
+
+        document.addEventListener("fullscreenchange", () => {
+            if (focusedClient && !document.fullscreenElement) {
+                exitFocusMode(true);
+            }
+        });
+
         window.addEventListener("keydown", (e) => {
             if (e.key === "Escape") {
                 if (historyCtxMenuEl.classList.contains("open")) {
@@ -872,7 +1589,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     closePinContextMenu();
                     return;
                 }
-                closeModal();
+                if (cookieModalBackdrop.classList.contains("open")) {
+                    closeCookieModal();
+                    return;
+                }
+                if (modalBackdrop.classList.contains("open")) {
+                    closeModal();
+                    return;
+                }
+                if (focusedClient) {
+                    exitFocusMode();
+                    return;
+                }
                 return;
             }
             if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
@@ -1022,6 +1750,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return `${hh}:${mm}`;
         }
 
+        let hlsLibPromise = null;
+        function ensureHlsLib() {
+            if (window.Hls) return Promise.resolve(window.Hls);
+            if (hlsLibPromise) return hlsLibPromise;
+            hlsLibPromise = new Promise((resolve, reject) => {
+                const s = document.createElement("script");
+                s.src = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js";
+                s.onload = () => resolve(window.Hls);
+                s.onerror = () => {
+                    hlsLibPromise = null;
+                    reject(new Error("hls.js 로드 실패"));
+                };
+                document.head.appendChild(s);
+            });
+            return hlsLibPromise;
+        }
+
         class ChatClient {
             constructor(channel, container) {
                 this.channel = channel;
@@ -1030,6 +1775,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.pingTimer = null;
                 this.reconnectTimer = null;
                 this.livePollTimer = null;
+
+                this.hls = null;
+                this.isVideoOpen = false;
+                this.videoLoadSeq = 0;
+                this.preferredQuality = 360;
 
                 this.isDestroyed = false;
                 this.isConnecting = false;
@@ -1053,30 +1803,50 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 container.innerHTML = `
                     <div class="header">
-                        <h1 class="streamer-name" title="클릭하여 이 칸의 스트리머 변경">${escapeHtml(channel.name)}</h1>
+                        <h1 class="streamer-name" title="클릭하여 치지직 방송 페이지 열기">${escapeHtml(channel.name)}</h1>
                         <div class="header-controls">
+                            <button class="btn-mini btn-video-toggle" title="상단 미니 영상 켜기/끄기 (Shift+클릭: 전체 동시 토글)">📺</button>
                             <button class="btn-mini btn-pin-toggle" title="스트리머·매니저 칸 접기/펴기 (우클릭: 일괄 메뉴)">📌</button>
                             <span class="status-dot" title="연결 상태"></span>
                             <button class="btn-mini btn-reconnect">재연결</button>
                             <button class="btn-mini btn-close-col" title="이 칸 닫기">×</button>
                         </div>
                     </div>
-                    <div class="pinned-panel">
-                        <div class="pinned-header">
-                            <span>📌 스트리머 · 매니저</span>
-                            <div class="pinned-actions">
-                                <button class="btn-pin-sub btn-clear-pin">비우기</button>
-                                <button class="btn-pin-sub btn-hide-pin">접기</button>
+                    <div class="col-body">
+                        <div class="video-panel hidden" title="더블클릭: 전체화면 집중 모드 (최고 화질)">
+                            <video class="video-player" muted playsinline autoplay></video>
+                            <div class="video-msg hidden"></div>
+                            <div class="video-overlay">
+                                <span class="video-info-badge">LIVE</span>
+                                <div class="video-overlay-actions">
+                                    <button type="button" class="btn-video-ctrl btn-video-mute" title="음소거 / 해제">🔇</button>
+                                    <button type="button" class="btn-video-ctrl btn-video-qual" title="화질 전환 (360p / 480p / 720p / 원본)">360p</button>
+                                    <button type="button" class="btn-video-ctrl btn-video-focus" title="전체화면 집중 모드 (더블클릭)">⤢</button>
+                                    <button type="button" class="btn-video-ctrl btn-video-reload" title="영상 새로고침">↻</button>
+                                    <button type="button" class="btn-video-ctrl btn-video-close" title="영상 닫기">×</button>
+                                </div>
                             </div>
                         </div>
-                        <div class="pinned-list">
-                            <div class="pinned-empty">스트리머·매니저 채팅이 여기에 표시됩니다.</div>
+                        <div class="focus-resizer" title="드래그: 채팅창 너비 조절 | 더블클릭: 기본 너비 초기화"></div>
+                        <div class="chat-pane">
+                            <div class="pinned-panel">
+                                <div class="pinned-header">
+                                    <span>📌 스트리머 · 매니저</span>
+                                    <div class="pinned-actions">
+                                        <button class="btn-pin-sub btn-clear-pin">비우기</button>
+                                        <button class="btn-pin-sub btn-hide-pin">접기</button>
+                                    </div>
+                                </div>
+                                <div class="pinned-list">
+                                    <div class="pinned-empty">스트리머·매니저 채팅이 여기에 표시됩니다.</div>
+                                </div>
+                            </div>
+                            <div class="resizer" title="드래그: 칸 높이 조절 | Shift+드래그: 전체 동시 조절 | 더블클릭: 1/5 초기화"></div>
+                            <div class="messages-wrap">
+                                <div class="messages"></div>
+                                <button class="btn-scroll-bottom">↓ 최신 채팅</button>
+                            </div>
                         </div>
-                    </div>
-                    <div class="resizer" title="드래그: 칸 높이 조절 | Shift+드래그: 전체 동시 조절 | 더블클릭: 1/5 초기화"></div>
-                    <div class="messages-wrap">
-                        <div class="messages"></div>
-                        <button class="btn-scroll-bottom">↓ 최신 채팅</button>
                     </div>
                 `;
 
@@ -1084,8 +1854,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.nameEl = container.querySelector(".streamer-name");
                 this.controlsEl = container.querySelector(".header-controls");
                 this.dotEl = container.querySelector(".status-dot");
+                this.chatPaneEl = container.querySelector(".chat-pane");
                 this.msgsEl = container.querySelector(".messages");
                 this.scrollBtnEl = container.querySelector(".btn-scroll-bottom");
+                this.videoPanelEl = container.querySelector(".video-panel");
+                this.videoEl = container.querySelector(".video-player");
+                this.videoMsgEl = container.querySelector(".video-msg");
+                this.videoBadgeEl = container.querySelector(".video-info-badge");
+                this.toggleVideoBtn = container.querySelector(".btn-video-toggle");
+                this.videoMuteBtn = container.querySelector(".btn-video-mute");
+                this.videoQualBtn = container.querySelector(".btn-video-qual");
+                this.videoFocusBtn = container.querySelector(".btn-video-focus");
+                this.videoReloadBtn = container.querySelector(".btn-video-reload");
+                this.videoCloseBtn = container.querySelector(".btn-video-close");
                 this.pinPanelEl = container.querySelector(".pinned-panel");
                 this.pinListEl = container.querySelector(".pinned-list");
                 this.resizerEl = container.querySelector(".resizer");
@@ -1095,8 +1876,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.clearPinBtn = container.querySelector(".btn-clear-pin");
                 this.hidePinBtn = container.querySelector(".btn-hide-pin");
 
-                this.nameEl.onclick = () => openReplaceModal(this.channel.id);
+                this.nameEl.onclick = () => {
+                    window.open(`https://chzzk.naver.com/live/${this.channel.id}`, "_blank", "noopener");
+                };
                 this.closeColBtn.onclick = () => removeChannel(this.channel.id);
+
+                this.toggleVideoBtn.onclick = (e) => {
+                    const nextOpen = !this.isVideoOpen;
+                    if (e.shiftKey) {
+                        clientMap.forEach(c => c.setVideoOpen(nextOpen));
+                    } else {
+                        this.setVideoOpen(nextOpen);
+                    }
+                };
+                this.videoPanelEl.ondblclick = (e) => {
+                    if (e.target.closest(".video-overlay")) return;
+                    toggleFocusMode(this);
+                };
+                this.videoMuteBtn.onclick = () => this.toggleVideoMute();
+                this.videoQualBtn.onclick = () => this.cycleVideoQuality();
+                this.videoFocusBtn.onclick = () => toggleFocusMode(this);
+                this.videoReloadBtn.onclick = () => this.startVideo();
+                this.videoCloseBtn.onclick = () => this.setVideoOpen(false);
 
                 const savedRatio = localStorage.getItem(`chzzk_pin_ratio_${channel.id}`);
                 if (savedRatio) {
@@ -1291,12 +2092,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 this.onMouseMove = (e) => {
                     if (!isDragging) return;
-                    const boxRect = this.container.getBoundingClientRect();
-                    const headerH = this.headerEl.offsetHeight;
-                    const availableH = boxRect.height - headerH;
+                    const paneRect = this.chatPaneEl.getBoundingClientRect();
+                    const availableH = paneRect.height;
                     if (availableH <= 0) return;
 
-                    const newPinH = e.clientY - boxRect.top - headerH;
+                    const newPinH = e.clientY - paneRect.top;
                     const percent = (newPinH / availableH) * 100;
 
                     if (e.shiftKey) {
@@ -1436,6 +2236,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             this.setSystemStatus("방송 시작 감지! 새 채팅방으로 전환합니다...", false);
                             this.retryCount = 0;
                             this.connect(true);
+                            if (this.isVideoOpen) {
+                                this.startVideo();
+                            }
                         }
                     } catch (e) {}
                 }, 30000);
@@ -1648,6 +2451,206 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return div;
             }
 
+            setVideoMessage(msg) {
+                if (msg) {
+                    this.videoMsgEl.textContent = msg;
+                    this.videoMsgEl.classList.remove("hidden");
+                } else {
+                    this.videoMsgEl.textContent = "";
+                    this.videoMsgEl.classList.add("hidden");
+                }
+            }
+
+            setVideoOpen(open) {
+                if (!open && focusedClient === this) {
+                    exitFocusMode();
+                }
+                if (this.isVideoOpen === open) return;
+                this.isVideoOpen = open;
+                this.runWithAnchorPreserved(() => {
+                    if (open) {
+                        this.videoPanelEl.classList.remove("hidden");
+                        this.toggleVideoBtn.classList.add("active");
+                    } else {
+                        this.videoPanelEl.classList.add("hidden");
+                        this.toggleVideoBtn.classList.remove("active");
+                    }
+                });
+                if (open) {
+                    this.startVideo();
+                } else {
+                    this.stopVideo();
+                }
+            }
+
+            setVideoMuted(muted) {
+                this.videoEl.muted = !!muted;
+                this.videoMuteBtn.textContent = this.videoEl.muted ? "🔇" : "🔊";
+            }
+
+            toggleVideoMute() {
+                this.setVideoMuted(!this.videoEl.muted);
+            }
+
+            applyPreferredVideoLevel() {
+                if (!this.hls || !Array.isArray(this.hls.levels) || this.hls.levels.length === 0) return;
+                const levels = this.hls.levels;
+                let chosenIdx = -1;
+
+                if (this.preferredQuality === 0) {
+                    let maxH = -1;
+                    let maxBitrate = -1;
+                    for (let i = 0; i < levels.length; i++) {
+                        const h = levels[i].height || 0;
+                        const b = levels[i].bitrate || 0;
+                        if (h > maxH || (h === maxH && b > maxBitrate)) {
+                            maxH = h;
+                            maxBitrate = b;
+                            chosenIdx = i;
+                        }
+                    }
+                } else {
+                    let bestHeight = 0;
+                    let bestBitrate = -1;
+                    for (let i = 0; i < levels.length; i++) {
+                        const h = levels[i].height || 0;
+                        const b = levels[i].bitrate || 0;
+                        if (h > 0 && h <= this.preferredQuality && (h > bestHeight || (h === bestHeight && b > bestBitrate))) {
+                            bestHeight = h;
+                            bestBitrate = b;
+                            chosenIdx = i;
+                        }
+                    }
+                    if (chosenIdx === -1) {
+                        let minH = Infinity;
+                        for (let i = 0; i < levels.length; i++) {
+                            const h = levels[i].height || Infinity;
+                            if (h < minH) {
+                                minH = h;
+                                chosenIdx = i;
+                            }
+                        }
+                    }
+                }
+
+                if (chosenIdx >= 0) {
+                    this.hls.currentLevel = chosenIdx;
+                    const actualH = levels[chosenIdx].height;
+                    this.videoQualBtn.textContent = actualH
+                        ? `${actualH}p`
+                        : (this.preferredQuality === 0 ? "원본" : `${this.preferredQuality}p`);
+                }
+            }
+
+            cycleVideoQuality() {
+                const order = [360, 480, 720, 0];
+                const idx = order.indexOf(this.preferredQuality);
+                this.preferredQuality = order[(idx + 1) % order.length];
+                this.videoQualBtn.textContent = this.preferredQuality === 0 ? "원본" : `${this.preferredQuality}p`;
+                this.applyPreferredVideoLevel();
+            }
+
+            stopVideo() {
+                this.videoLoadSeq += 1;
+                if (this.hls) {
+                    this.hls.destroy();
+                    this.hls = null;
+                }
+                this.videoEl.pause();
+                this.videoEl.removeAttribute("src");
+                this.videoEl.load();
+                this.setVideoMessage("");
+            }
+
+            async startVideo() {
+                if (this.isDestroyed || !this.isVideoOpen) return;
+                this.stopVideo();
+                const seq = this.videoLoadSeq;
+                this.setVideoMessage("방송 스트림 불러오는 중...");
+
+                try {
+                    const [res, HlsLib] = await Promise.all([
+                        fetch(`/api/stream?channelId=${this.channel.id}`),
+                        ensureHlsLib()
+                    ]);
+                    if (this.isDestroyed || !this.isVideoOpen || seq !== this.videoLoadSeq) return;
+
+                    const info = await res.json();
+                    if (info.error || !info.hlsUrl) {
+                        this.setVideoMessage(info.error || "재생할 수 있는 방송이 없습니다.");
+                        return;
+                    }
+
+                    const badgeTxt = info.category || "LIVE";
+                    this.videoBadgeEl.textContent = info.userCount
+                        ? `${badgeTxt} · ${info.userCount.toLocaleString()}명`
+                        : badgeTxt;
+                    this.videoPanelEl.title = info.title || "";
+
+                    if (HlsLib && HlsLib.isSupported()) {
+                        const hls = new HlsLib({
+                            lowLatencyMode: true,
+                            autoStartLoad: false,
+                            liveSyncDuration: 2.0,
+                            liveMaxLatencyDuration: 3.5,
+                            maxLiveSyncPlaybackRate: 1.25,
+                            maxBufferLength: 4,
+                            maxMaxBufferLength: 8,
+                            backBufferLength: 4,
+                            capLevelToPlayerSize: false
+                        });
+                        this.hls = hls;
+                        let retriedMedia = false;
+                        let usedFallback = false;
+
+                        hls.on(HlsLib.Events.MANIFEST_PARSED, () => {
+                            if (this.isDestroyed || seq !== this.videoLoadSeq) return;
+                            this.applyPreferredVideoLevel();
+                            hls.startLoad(-1);
+                            this.setVideoMessage("");
+                            this.videoEl.play().catch(() => {});
+                        });
+
+                        hls.on(HlsLib.Events.ERROR, (evt, data) => {
+                            if (this.isDestroyed || seq !== this.videoLoadSeq || !data?.fatal) return;
+                            if (!retriedMedia && data.type === HlsLib.ErrorTypes.MEDIA_ERROR) {
+                                retriedMedia = true;
+                                hls.recoverMediaError();
+                                return;
+                            }
+                            if (!usedFallback && info.hlsFallbackUrl) {
+                                usedFallback = true;
+                                hls.loadSource(info.hlsFallbackUrl);
+                                return;
+                            }
+                            this.setVideoMessage("영상 연결이 끊어졌습니다. (↻ 새로고침)");
+                        });
+
+                        hls.loadSource(info.hlsUrl);
+                        hls.attachMedia(this.videoEl);
+                    } else if (this.videoEl.canPlayType("application/vnd.apple.mpegurl")) {
+                        this.videoEl.src = info.hlsUrl;
+                        this.setVideoMessage("");
+                        this.videoEl.play().catch(() => {});
+                    } else {
+                        this.setVideoMessage("이 브라우저는 HLS 재생을 지원하지 않습니다.");
+                    }
+                } catch (err) {
+                    if (this.isDestroyed || seq !== this.videoLoadSeq) return;
+                    this.setVideoMessage("영상 로드 중 오류가 발생했습니다.");
+                }
+            }
+
+            snapToLiveEdge() {
+                try {
+                    if (this.hls && typeof this.hls.liveSyncPosition === "number" && this.hls.liveSyncPosition > 0) {
+                        if (this.hls.liveSyncPosition - this.videoEl.currentTime > 3.5) {
+                            this.videoEl.currentTime = this.hls.liveSyncPosition;
+                        }
+                    }
+                } catch (e) {}
+            }
+
             disconnectSocket() {
                 if (this.reconnectTimer) {
                     clearTimeout(this.reconnectTimer);
@@ -1668,6 +2671,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
 
             destroy() {
+                if (focusedClient === this) {
+                    exitFocusMode(true);
+                }
                 this.isDestroyed = true;
                 this.isConnecting = false;
                 dirtyClients.delete(this);
@@ -1677,6 +2683,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     clearInterval(this.livePollTimer);
                     this.livePollTimer = null;
                 }
+                this.stopVideo();
                 this.disconnectSocket();
                 if (this.ro) this.ro.disconnect();
                 window.removeEventListener("mousemove", this.onMouseMove);
@@ -1687,9 +2694,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function syncLayout() {
             const wrapper = document.getElementById("wrapper");
-            const globalTools = document.getElementById("global-tools");
-
-            document.body.appendChild(globalTools);
 
             const activeIds = new Set(activeChannels.map(c => c.id));
             for (const [id, client] of clientMap.entries()) {
@@ -1718,7 +2722,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             wrapper.style.gridTemplateColumns = `repeat(${activeChannels.length}, 1fr)`;
 
-            activeChannels.forEach((ch, idx) => {
+            activeChannels.forEach((ch) => {
                 let client = clientMap.get(ch.id);
                 if (!client) {
                     const box = document.createElement("div");
@@ -1729,10 +2733,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 wrapper.appendChild(client.container);
 
                 client.closeColBtn.style.display = activeChannels.length > 1 ? "inline-block" : "none";
-
-                if (idx === activeChannels.length - 1) {
-                    client.controlsEl.insertBefore(globalTools, client.controlsEl.firstChild);
-                }
             });
 
             localStorage.setItem(STORAGE_CHANNELS_KEY, JSON.stringify(activeChannels));
@@ -1760,26 +2760,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return false;
             }
             if (activeChannels.length >= 6) {
-                setSearchStatus("최대 6명까지만 동시에 볼 수 있습니다. 기존 칸을 닫거나 이름을 눌러 교체하세요.");
+                setSearchStatus("최대 6명까지만 동시에 볼 수 있습니다. 기존 칸을 닫고 추가하세요.");
                 return false;
             }
             activeChannels.push({ id: ch.id, name: ch.name });
             syncLayout();
             scheduleSaveHistoryToServer();
-            return true;
-        }
-
-        function replaceChannel(targetId, newCh) {
-            if (targetId !== newCh.id && activeChannels.some(c => c.id === newCh.id)) {
-                setSearchStatus("이미 다른 칸에 열려 있는 스트리머입니다.");
-                return false;
-            }
-            const idx = activeChannels.findIndex(c => c.id === targetId);
-            if (idx !== -1) {
-                activeChannels[idx] = { id: newCh.id, name: newCh.name };
-                syncLayout();
-                scheduleSaveHistoryToServer();
-            }
             return true;
         }
 
@@ -1800,15 +2786,99 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             scheduleSaveHistoryToServer();
         }
 
-        let modalMode = "manage";
-        let replaceTargetId = null;
-
         const modalBackdrop = document.getElementById("modal-backdrop");
         const modalTitle = document.getElementById("modal-title");
         const searchInput = document.getElementById("search-input");
         const searchStatus = document.getElementById("search-status");
         const searchResultsEl = document.getElementById("search-results");
         const activeSectionEl = document.getElementById("active-section");
+
+        const cookieModalBackdrop = document.getElementById("cookie-modal-backdrop");
+        const cookieBtn = document.getElementById("btn-cookie-settings");
+        const cookieStatusTxt = document.getElementById("cookie-status-txt");
+        const cookieAutInput = document.getElementById("cookie-nid-aut");
+        const cookieSesInput = document.getElementById("cookie-nid-ses");
+
+        function applyCookieUiState(info) {
+            const has = !!(info && info.hasCookie);
+            if (has) {
+                cookieBtn.classList.add("active");
+                cookieBtn.title = `네이버 쿠키 설정됨 (${info.nidAutPreview || ""})`;
+                cookieStatusTxt.textContent = `현재 상태: 설정됨 (${info.nidAutPreview || "NID_AUT"})`;
+                cookieStatusTxt.style.color = "#00ffa3";
+            } else {
+                cookieBtn.classList.remove("active");
+                cookieBtn.title = "네이버 로그인 쿠키 설정 (성인 인증 방송용)";
+                cookieStatusTxt.textContent = "현재 상태: 미설정";
+                cookieStatusTxt.style.color = "#a1a1aa";
+            }
+        }
+
+        async function refreshCookieStatus() {
+            try {
+                const res = await fetch("/api/cookies");
+                const info = await res.json();
+                applyCookieUiState(info);
+            } catch (e) {}
+        }
+
+        function openCookieModal() {
+            cookieAutInput.value = "";
+            cookieSesInput.value = "";
+            refreshCookieStatus();
+            cookieModalBackdrop.classList.add("open");
+            setTimeout(() => cookieAutInput.focus(), 30);
+        }
+
+        function closeCookieModal() {
+            cookieModalBackdrop.classList.remove("open");
+        }
+
+        cookieBtn.onclick = openCookieModal;
+        document.getElementById("cookie-modal-close").onclick = closeCookieModal;
+        cookieModalBackdrop.onclick = (e) => {
+            if (e.target === cookieModalBackdrop) closeCookieModal();
+        };
+
+        document.getElementById("btn-cookie-save").onclick = async () => {
+            const nidAut = cookieAutInput.value.trim();
+            const nidSes = cookieSesInput.value.trim();
+            if (!nidAut || !nidSes) {
+                cookieStatusTxt.textContent = "NID_AUT와 NID_SES를 모두 입력하세요.";
+                cookieStatusTxt.style.color = "#ff6b6b";
+                return;
+            }
+            try {
+                const res = await fetch("/api/cookies", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ nidAut, nidSes })
+                });
+                const info = await res.json();
+                applyCookieUiState(info);
+                cookieAutInput.value = "";
+                cookieSesInput.value = "";
+                cookieStatusTxt.textContent = "저장 완료! (성인 방송도 📺 새로고침 시 반영됩니다)";
+                cookieStatusTxt.style.color = "#00ffa3";
+            } catch (e) {
+                cookieStatusTxt.textContent = "저장 중 오류가 발생했습니다.";
+                cookieStatusTxt.style.color = "#ff6b6b";
+            }
+        };
+
+        document.getElementById("btn-cookie-clear").onclick = async () => {
+            try {
+                const res = await fetch("/api/cookies", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ clear: true })
+                });
+                const info = await res.json();
+                applyCookieUiState(info);
+                cookieAutInput.value = "";
+                cookieSesInput.value = "";
+            } catch (e) {}
+        };
 
         function setSearchStatus(msg) {
             searchStatus.textContent = msg;
@@ -1857,9 +2927,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const titleEl = document.getElementById("history-section-title");
             if (!listEl) return;
 
-            titleEl.textContent = modalMode === "replace"
-                ? "📜 최근 기록 (칩 클릭: 이 칸 교체 / 우클릭: 메뉴)"
-                : "📜 최근 기록 (칩 클릭: 1명 추가 / 우클릭: 메뉴)";
+            titleEl.textContent = "📜 최근 기록 (칩 클릭: 1명 추가 / 우클릭: 메뉴)";
             countEl.textContent = `${modalHistory.length} / 9`;
             listEl.innerHTML = "";
 
@@ -1892,9 +2960,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     chip.type = "button";
                     chip.className = "history-chip";
                     chip.textContent = ch.name;
-                    chip.title = modalMode === "replace"
-                        ? `'${ch.name}'(으)로 이 칸 교체 (우클릭: 메뉴)`
-                        : `'${ch.name}' 추가 (우클릭: 메뉴)`;
+                    chip.title = `'${ch.name}' 추가 (우클릭: 메뉴)`;
                     chip.onclick = () => applySelectedStreamer(ch);
                     chip.oncontextmenu = (e) => openHistoryContextMenu(e, comboIdx, ch);
                     chipsEl.appendChild(chip);
@@ -1903,15 +2969,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const actionsEl = document.createElement("div");
                 actionsEl.className = "history-actions";
 
-                if (modalMode !== "replace") {
-                    const loadBtn = document.createElement("button");
-                    loadBtn.type = "button";
-                    loadBtn.className = "btn-mini";
-                    loadBtn.textContent = "전체";
-                    loadBtn.title = "이 조합 전체로 화면 전환";
-                    loadBtn.onclick = () => applyComboFromHistory(comboIdx);
-                    actionsEl.appendChild(loadBtn);
-                }
+                const loadBtn = document.createElement("button");
+                loadBtn.type = "button";
+                loadBtn.className = "btn-mini";
+                loadBtn.textContent = "전체";
+                loadBtn.title = "이 조합 전체로 화면 전환";
+                loadBtn.onclick = () => applyComboFromHistory(comboIdx);
+                actionsEl.appendChild(loadBtn);
 
                 const delBtn = document.createElement("button");
                 delBtn.type = "button";
@@ -1929,29 +2993,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function openManageModal() {
-            modalMode = "manage";
-            replaceTargetId = null;
             modalTitle.textContent = "스트리머 추가 · 편성 관리";
             activeSectionEl.style.display = "block";
             searchInput.value = "";
             searchResultsEl.innerHTML = "";
             setSearchStatus("이름, 채널 ID 또는 치지직 URL을 입력하고 엔터를 누르세요.");
             renderModalActiveList();
-            renderModalHistory();
-            loadModalHistory();
-            modalBackdrop.classList.add("open");
-            setTimeout(() => searchInput.focus(), 30);
-        }
-
-        function openReplaceModal(targetId) {
-            const target = activeChannels.find(c => c.id === targetId);
-            modalMode = "replace";
-            replaceTargetId = targetId;
-            modalTitle.textContent = `'${target ? target.name : ""}' 칸 스트리머 교체`;
-            activeSectionEl.style.display = "none";
-            searchInput.value = "";
-            searchResultsEl.innerHTML = "";
-            setSearchStatus("교체할 스트리머 이름, 채널 ID 또는 URL을 입력하세요.");
             renderModalHistory();
             loadModalHistory();
             modalBackdrop.classList.add("open");
@@ -2041,16 +3088,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function applySelectedStreamer(item) {
-            if (modalMode === "replace" && replaceTargetId) {
-                if (replaceChannel(replaceTargetId, item)) {
-                    closeModal();
-                }
-            } else {
-                if (addChannel(item)) {
-                    searchInput.value = "";
-                    searchResultsEl.innerHTML = "";
-                    setSearchStatus(`'${item.name}' 채널이 추가되었습니다.`);
-                }
+            if (addChannel(item)) {
+                searchInput.value = "";
+                searchResultsEl.innerHTML = "";
+                setSearchStatus(`'${item.name}' 채널이 추가되었습니다.`);
             }
         }
 
@@ -2062,8 +3103,116 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         });
 
+        let globalToolsIntroTimer = null;
+        let globalToolsPendingCollapse = false;
+
+        function finishGlobalToolsIntro(shouldCollapse = true) {
+            const tools = document.getElementById("global-tools");
+            if (!tools) return;
+            if (globalToolsIntroTimer) {
+                clearTimeout(globalToolsIntroTimer);
+                globalToolsIntroTimer = null;
+            }
+            globalToolsPendingCollapse = false;
+            tools.classList.remove("intro-spotlight");
+            if (shouldCollapse) {
+                tools.classList.add("is-collapsed");
+            }
+        }
+
+        function triggerGlobalToolsIntro() {
+            const tools = document.getElementById("global-tools");
+            if (!tools) return;
+            tools.classList.remove("is-collapsed");
+            tools.classList.add("intro-spotlight");
+            globalToolsPendingCollapse = false;
+            if (globalToolsIntroTimer) clearTimeout(globalToolsIntroTimer);
+            globalToolsIntroTimer = setTimeout(() => {
+                globalToolsIntroTimer = null;
+                if (tools.matches(":hover")) {
+                    globalToolsPendingCollapse = true;
+                    return;
+                }
+                finishGlobalToolsIntro(true);
+            }, 5500);
+        }
+
+        (function setupGlobalTools() {
+            const tools = document.getElementById("global-tools");
+            const expandBtn = document.getElementById("btn-tools-expand");
+            const collapseBtn = document.getElementById("btn-tools-collapse");
+            const hintEl = document.getElementById("global-tools-hint");
+            const hintCloseBtn = document.getElementById("btn-tools-hint-close");
+            if (!tools) return;
+
+            let expandNearHover = false;
+            function setExpandNearHover(next) {
+                if (!expandBtn || expandNearHover === next) return;
+                expandNearHover = next;
+                expandBtn.classList.toggle("near-hover", next);
+            }
+
+            tools.addEventListener("mouseleave", () => {
+                if (globalToolsPendingCollapse) {
+                    finishGlobalToolsIntro(true);
+                }
+            });
+
+            if (expandBtn) {
+                expandBtn.addEventListener("click", () => {
+                    globalToolsPendingCollapse = false;
+                    setExpandNearHover(false);
+                    tools.classList.remove("is-collapsed");
+                });
+            }
+            if (collapseBtn) {
+                collapseBtn.addEventListener("click", () => {
+                    setExpandNearHover(false);
+                    finishGlobalToolsIntro(true);
+                });
+            }
+            if (hintCloseBtn) {
+                hintCloseBtn.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    finishGlobalToolsIntro(true);
+                });
+            }
+            if (hintEl) {
+                hintEl.addEventListener("click", () => {
+                    finishGlobalToolsIntro(true);
+                });
+            }
+
+            document.addEventListener("mousemove", (e) => {
+                if (!expandBtn || !tools.classList.contains("is-collapsed")) {
+                    setExpandNearHover(false);
+                    return;
+                }
+                if (window.innerWidth - e.clientX > 56) {
+                    setExpandNearHover(false);
+                    return;
+                }
+                const rect = expandBtn.getBoundingClientRect();
+                const nearX = e.clientX >= rect.right - 56;
+                const nearY = e.clientY >= rect.top - 32 && e.clientY <= rect.bottom + 32;
+                setExpandNearHover(nearX && nearY);
+            }, { passive: true });
+            document.addEventListener("mouseleave", () => setExpandNearHover(false));
+            window.addEventListener("blur", () => setExpandNearHover(false));
+
+            document.addEventListener("pointerdown", (e) => {
+                if (!tools.classList.contains("is-collapsed") && !tools.contains(e.target)) {
+                    setExpandNearHover(false);
+                    finishGlobalToolsIntro(true);
+                }
+            });
+
+            triggerGlobalToolsIntro();
+        })();
+
         applyFontSize(currentFontSize);
         syncLayout();
+        refreshCookieStatus();
         if (activeChannels.length === 0) {
             openManageModal();
         }
@@ -2120,6 +3269,14 @@ class MultiChatHandler(BaseHTTPRequestHandler):
                 200, "application/json; charset=utf-8", json.dumps(result, ensure_ascii=False).encode("utf-8")
             )
 
+        elif parsed.path == "/api/stream":
+            qs = urllib.parse.parse_qs(parsed.query)
+            channel_id = (qs.get("channelId") or [""])[0]
+            result = get_stream_info(channel_id)
+            self.send_bytes(
+                200, "application/json; charset=utf-8", json.dumps(result, ensure_ascii=False).encode("utf-8")
+            )
+
         elif parsed.path == "/api/search":
             qs = urllib.parse.parse_qs(parsed.query)
             keyword = (qs.get("keyword") or [""])[0].strip()
@@ -2132,6 +3289,12 @@ class MultiChatHandler(BaseHTTPRequestHandler):
             history = load_history()
             self.send_bytes(
                 200, "application/json; charset=utf-8", json.dumps(history, ensure_ascii=False).encode("utf-8")
+            )
+
+        elif parsed.path == "/api/cookies":
+            status = get_cookie_status()
+            self.send_bytes(
+                200, "application/json; charset=utf-8", json.dumps(status, ensure_ascii=False).encode("utf-8")
             )
 
         else:
@@ -2181,6 +3344,26 @@ class MultiChatHandler(BaseHTTPRequestHandler):
                 200,
                 "application/json; charset=utf-8",
                 json.dumps({"ok": True, "history": history}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        elif parsed.path == "/api/cookies":
+            body = self.read_json_body()
+            if not isinstance(body, dict):
+                self.send_bytes(400, "application/json; charset=utf-8", b'{"ok":false}')
+                return
+            if body.get("clear"):
+                clear_cookies()
+            else:
+                nid_aut = str(body.get("nidAut") or "").strip()
+                nid_ses = str(body.get("nidSes") or "").strip()
+                if not nid_aut or not nid_ses:
+                    self.send_bytes(400, "application/json; charset=utf-8", b'{"ok":false}')
+                    return
+                save_cookies(nid_aut, nid_ses)
+            status = get_cookie_status()
+            status["ok"] = True
+            self.send_bytes(
+                200, "application/json; charset=utf-8", json.dumps(status, ensure_ascii=False).encode("utf-8")
             )
 
         else:
@@ -2576,6 +3759,31 @@ def run_version_selector():
 
     switch_to_version(chosen)
 
+def run_cookie_manager():
+    """터미널에서 네이버 로그인 쿠키(NID_AUT, NID_SES)를 설정하거나 삭제합니다."""
+    status = get_cookie_status()
+    print("\n--------------------------------------------------")
+    print(" 🔑 네이버 로그인 쿠키 설정 (성인 인증 방송용)")
+    print(f"   현재 상태: {'설정됨 (' + status['nidAutPreview'] + ')' if status['hasCookie'] else '미설정'}")
+    print("   확인 방법: chzzk.naver.com → F12 → Application → Cookies")
+    print("   [1] 쿠키 입력/변경   [2] 저장된 쿠키 삭제   [엔터] 돌아가기")
+    print("--------------------------------------------------")
+
+    choice = input("👉 선택: ").strip()
+    if choice == "1":
+        nid_aut = input(" 👉 NID_AUT 입력: ").strip()
+        nid_ses = input(" 👉 NID_SES 입력: ").strip()
+        if nid_aut and nid_ses:
+            save_cookies(nid_aut, nid_ses)
+            print(" ✅ 쿠키를 로컬 파일(chzzk_cookies.json)에 저장했습니다.\n")
+        else:
+            print(" ❌ NID_AUT와 NID_SES를 모두 입력해야 저장됩니다.\n")
+    elif choice == "2":
+        clear_cookies()
+        print(" 🗑 저장된 쿠키를 삭제했습니다.\n")
+    else:
+        print()
+
 def main():
     global INITIAL_CHANNELS
     print("==================================================")
@@ -2591,6 +3799,7 @@ def main():
 
     while True:
         history = load_history()
+        cookie_st = get_cookie_status()
 
         print(" 보고 싶은 스트리머를 입력하세요 (콤마 , 로 여러 명 입력)")
         print("   • 이름 / 채널 ID / 치지직 주소 모두 가능")
@@ -2598,10 +3807,12 @@ def main():
             print("   • 엔터만 누르면 직전 기록 [1] 바로 실행")
             print()
             print(" [빠른 입력]  1 = 1번 전체   12 = 1번의 2번째 스트리머")
-            print("              d1 = 1번 삭제  n = 빈 화면   v = 버전 선택")
+            print("              d1 = 1번 삭제  n = 빈 화면  c = 쿠키  v = 버전")
         else:
             print("   • 엔터만 누르면 빈 화면으로 시작해 웹에서 검색 가능")
-            print("   • 'v' 입력 시 GitHub 버전 선택/업데이트")
+            print("   • c = 쿠키 설정   v = GitHub 버전 선택/업데이트")
+        if cookie_st["hasCookie"]:
+            print(f"   • 🔑 쿠키 설정됨 ({cookie_st['nidAutPreview']})")
         print("--------------------------------------------------")
 
         try:
@@ -2612,6 +3823,10 @@ def main():
 
         if user_input.lower() == "v":
             run_version_selector()
+            continue
+
+        if user_input.lower() == "c":
+            run_cookie_manager()
             continue
 
         if history and user_input.lower().startswith("d") and user_input[1:].strip().isdigit():
