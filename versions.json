@@ -1,6 +1,12 @@
 {
-  "latest": "v28",
+  "latest": "v29",
   "versions": [
+    {
+      "tag": "v29",
+      "date": "2026-11-26",
+      "note": "시작 시 최신 버전 완전 자동 업데이트 및 재실행 추가",
+      "url": "https://github.com/SiwonH/chzzk-multiview-chat/releases/download/v29/chzzk_chat.py"
+    },
     {
       "tag": "v28",
       "date": "2026-11-26",
