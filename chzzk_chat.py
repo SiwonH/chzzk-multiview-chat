@@ -11,7 +11,7 @@ import webbrowser
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-APP_VERSION = "v30"
+APP_VERSION = "v34"
 GITHUB_REPO = "SiwonH/chzzk-multiview-chat"
 GITHUB_ASSET_NAME = "chzzk_chat.py"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=15"
@@ -423,7 +423,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             display: inline-flex;
             flex-direction: row;
             align-items: stretch;
-            height: 85px;
+            height: 124px;
             box-sizing: border-box;
             padding: 0;
             border-radius: 10px 0 0 10px;
@@ -495,7 +495,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             display: none;
             width: 10px;
             min-width: 10px;
-            height: 85px;
+            height: 124px;
             box-sizing: border-box;
             border-radius: 8px 0 0 8px;
             background: rgba(22, 22, 30, 0.72);
@@ -717,18 +717,85 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         .video-panel:hover .video-overlay { opacity: 1; }
         .video-info-badge {
+            position: absolute;
+            top: 8px;
+            left: 8px;
             font-size: 10px;
             color: #e4e4e7;
-            background: rgba(20, 20, 26, 0.8);
+            background: rgba(20, 20, 26, 0.82);
             border: 1px solid #34343f;
             border-radius: 4px;
             padding: 2px 6px;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            max-width: 55%;
+            max-width: calc(100% - 16px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s;
         }
+        .video-panel:hover .video-info-badge { opacity: 1; }
         .video-overlay-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+        .video-vol-wrap {
+            display: inline-flex;
+            align-items: center;
+        }
+        .vol-slider {
+            appearance: none;
+            -webkit-appearance: none;
+            height: 4px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.24);
+            outline: none;
+            cursor: pointer;
+            accent-color: #00ffa3;
+        }
+        .vol-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            background: #00ffa3;
+            border: 1.5px solid #0b0b0e;
+            cursor: pointer;
+        }
+        .master-vol-slider {
+            width: 58px;
+        }
+        .vol-indicator {
+            font-size: 11px;
+            min-width: 30px;
+            text-align: right;
+            color: #d4d4d8;
+            font-variant-numeric: tabular-nums;
+            user-select: none;
+        }
+        .btn-mini.muted-active,
+        .btn-video-ctrl.muted-active {
+            color: #ff6b6b;
+            border-color: rgba(255, 107, 107, 0.5);
+        }
+        .video-vol-slider {
+            width: 0;
+            opacity: 0;
+            pointer-events: none;
+            margin: 0;
+            transition: width 0.16s, opacity 0.16s, margin 0.16s;
+        }
+        .video-vol-wrap:hover .video-vol-slider,
+        .video-vol-wrap:focus-within .video-vol-slider {
+            width: 58px;
+            opacity: 1;
+            pointer-events: auto;
+            margin: 0 2px 0 4px;
+        }
+        body.focus-mode .chat-box.is-focused .video-vol-slider {
+            width: 78px;
+            opacity: 1;
+            pointer-events: auto;
+            margin: 0 3px 0 4px;
+        }
         .btn-video-ctrl {
             background: rgba(24, 24, 30, 0.9);
             color: #e4e4e7;
@@ -1155,15 +1222,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <span class="font-indicator" id="font-size-val">20</span>
                     <button class="btn-mini" id="btn-font-up" title="글자 크게 (+)">+</button>
                 </div>
+                <div class="global-tools-section" aria-label="전체 볼륨 조절">
+                    <button class="btn-mini" id="btn-master-mute" title="전체 방송 일괄 음소거">🔊</button>
+                    <input type="range" class="vol-slider master-vol-slider" id="master-vol-slider" min="0" max="100" value="50" title="전체 마스터 볼륨 (개별 볼륨 비율 유지)">
+                    <span class="vol-indicator" id="master-vol-val">50%</span>
+                </div>
             </div>
         </div>
         <div class="global-tools-hint" id="global-tools-hint" title="클릭하면 닫히고 툴바가 접힙니다">
             <div class="global-tools-hint-head">
-                <span>⚙ 설정 · 쿠키 · 글자크기 (E)</span>
+                <span>⚙ 설정 · 쿠키 · 글자 · 볼륨 (E)</span>
                 <button type="button" class="global-tools-hint-close" id="btn-tools-hint-close" title="닫기">✕</button>
             </div>
             <div class="global-tools-hint-body">
-                스트리머 편성, 성인 인증 쿠키, 채팅 글자 크기를 여기서 바로 바꿀 수 있어요.
+                스트리머 편성, 성인 인증 쿠키, 글자 크기, 전체 마스터 볼륨을 여기서 바로 조절할 수 있어요.
             </div>
             <div class="global-tools-hint-sub">
                 잠시 후 오른쪽 끝 얇은 <b>[◀]</b> 버튼으로 접히며, 눌러서 언제든 다시 펼칠 수 있습니다.
@@ -1463,6 +1535,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             closeHistoryContextMenu();
         });
 
+        const MASTER_VOL_KEY = "chzzk_master_volume";
+        const MASTER_MUTE_KEY = "chzzk_master_muted";
+
+        function loadSavedPct(key, fallback = 100) {
+            const raw = localStorage.getItem(key);
+            if (raw === null) return fallback;
+            const num = Number(raw);
+            return Number.isFinite(num) ? Math.max(0, Math.min(100, Math.round(num))) : fallback;
+        }
+
+        let masterVolume = loadSavedPct(MASTER_VOL_KEY, 50);
+        let masterLastNonZero = masterVolume > 0 ? masterVolume : 50;
+        let masterMuted = localStorage.getItem(MASTER_MUTE_KEY) === "1";
+
+        function getEffectiveVolume(channelVolPct) {
+            if (masterMuted || masterVolume <= 0) return 0;
+            return Math.max(0, Math.min(1, (masterVolume / 100) * (channelVolPct / 100)));
+        }
+
+        function syncMasterVolumeUI() {
+            const muteBtn = document.getElementById("btn-master-mute");
+            const slider = document.getElementById("master-vol-slider");
+            const valEl = document.getElementById("master-vol-val");
+            const isMuted = masterMuted || masterVolume <= 0;
+            if (muteBtn) {
+                muteBtn.textContent = isMuted ? "🔇" : "🔊";
+                muteBtn.classList.toggle("muted-active", isMuted);
+                muteBtn.title = isMuted ? "전체 방송 음소거 해제" : "전체 방송 일괄 음소거";
+            }
+            if (slider) slider.value = String(isMuted ? 0 : masterVolume);
+            if (valEl) valEl.textContent = isMuted ? "음소거" : `${masterVolume}%`;
+        }
+
+        function syncAllClientAudio() {
+            syncMasterVolumeUI();
+            clientMap.forEach(c => c.applyAudioState());
+        }
+
         let focusedClient = null;
         let focusPrevFullscreen = false;
         let focusSuspendedClients = [];
@@ -1478,7 +1588,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             focusedClient = client;
             focusPrevFullscreen = !!document.fullscreenElement;
             focusPrevQuality = client.preferredQuality;
-            focusPrevMuted = client.videoEl.muted;
+            focusPrevMuted = client.isChannelMuted;
             focusSuspendedClients = [];
 
             clientMap.forEach((other) => {
@@ -1816,6 +1926,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.isVideoOpen = false;
                 this.videoLoadSeq = 0;
                 this.preferredQuality = 360;
+                this.channelVolume = loadSavedPct(`chzzk_channel_vol_${channel.id}`, 50);
+                this.lastNonZeroVol = this.channelVolume > 0 ? this.channelVolume : 50;
+                this.isChannelMuted = true;
 
                 this.isDestroyed = false;
                 this.isConnecting = false;
@@ -1852,10 +1965,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <div class="video-panel hidden" title="더블클릭: 전체화면 집중 모드 (최고 화질)">
                             <video class="video-player" muted playsinline autoplay></video>
                             <div class="video-msg hidden"></div>
+                            <span class="video-info-badge">LIVE</span>
                             <div class="video-overlay">
-                                <span class="video-info-badge">LIVE</span>
-                                <div class="video-overlay-actions">
+                                <div class="video-vol-wrap">
                                     <button type="button" class="btn-video-ctrl btn-video-mute" title="음소거 / 해제">🔇</button>
+                                    <input type="range" class="vol-slider video-vol-slider" min="0" max="100" value="50" title="이 방송 개별 볼륨">
+                                </div>
+                                <div class="video-overlay-actions">
                                     <button type="button" class="btn-video-ctrl btn-video-qual" title="화질 전환 (360p / 480p / 720p / 원본)">360p</button>
                                     <button type="button" class="btn-video-ctrl btn-video-focus" title="전체화면 집중 모드 (더블클릭)">⤢</button>
                                     <button type="button" class="btn-video-ctrl btn-video-reload" title="영상 새로고침">↻</button>
@@ -1899,6 +2015,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.videoBadgeEl = container.querySelector(".video-info-badge");
                 this.toggleVideoBtn = container.querySelector(".btn-video-toggle");
                 this.videoMuteBtn = container.querySelector(".btn-video-mute");
+                this.videoVolSlider = container.querySelector(".video-vol-slider");
                 this.videoQualBtn = container.querySelector(".btn-video-qual");
                 this.videoFocusBtn = container.querySelector(".btn-video-focus");
                 this.videoReloadBtn = container.querySelector(".btn-video-reload");
@@ -1930,6 +2047,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     toggleFocusMode(this);
                 };
                 this.videoMuteBtn.onclick = () => this.toggleVideoMute();
+                this.videoVolSlider.oninput = (e) => {
+                    this.setChannelVolume(Number(e.target.value));
+                };
+                this.applyAudioState();
                 this.videoQualBtn.onclick = () => this.cycleVideoQuality();
                 this.videoFocusBtn.onclick = () => toggleFocusMode(this);
                 this.videoReloadBtn.onclick = () => this.startVideo();
@@ -2519,13 +2640,51 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
             }
 
+            applyAudioState() {
+                const eff = getEffectiveVolume(this.channelVolume);
+                const isGloballyMuted = masterMuted || masterVolume <= 0;
+                const isSelfMuted = this.isChannelMuted || this.channelVolume <= 0;
+                const isAudible = !isSelfMuted && !isGloballyMuted && eff > 0;
+                this.videoEl.volume = eff;
+                this.videoEl.muted = !isAudible;
+                this.videoMuteBtn.textContent = isAudible ? "🔊" : "🔇";
+                this.videoMuteBtn.classList.toggle("muted-active", !isAudible);
+                if (isGloballyMuted && !isSelfMuted) {
+                    this.videoMuteBtn.title = "전체 음소거 적용 중 (개별 음소거 전환 가능)";
+                } else {
+                    this.videoMuteBtn.title = `음소거 / 해제 (개별 ${isSelfMuted ? "음소거" : this.channelVolume + "%"})`;
+                }
+                if (this.videoVolSlider) {
+                    this.videoVolSlider.value = String(isSelfMuted ? 0 : this.channelVolume);
+                    this.videoVolSlider.title = `이 방송 개별 볼륨: ${isSelfMuted ? 0 : this.channelVolume}% (실제 ${Math.round(eff * 100)}%)`;
+                }
+            }
+
+            setChannelVolume(pct) {
+                const clamped = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+                this.channelVolume = clamped;
+                if (clamped > 0) {
+                    this.lastNonZeroVol = clamped;
+                    this.isChannelMuted = false;
+                } else {
+                    this.isChannelMuted = true;
+                }
+                localStorage.setItem(`chzzk_channel_vol_${this.channel.id}`, String(this.channelVolume));
+                this.applyAudioState();
+            }
+
             setVideoMuted(muted) {
-                this.videoEl.muted = !!muted;
-                this.videoMuteBtn.textContent = this.videoEl.muted ? "🔇" : "🔊";
+                const nextMuted = !!muted;
+                if (!nextMuted && this.channelVolume <= 0) {
+                    this.channelVolume = this.lastNonZeroVol > 0 ? this.lastNonZeroVol : 50;
+                    localStorage.setItem(`chzzk_channel_vol_${this.channel.id}`, String(this.channelVolume));
+                }
+                this.isChannelMuted = nextMuted;
+                this.applyAudioState();
             }
 
             toggleVideoMute() {
-                this.setVideoMuted(!this.videoEl.muted);
+                this.setVideoMuted(!this.isChannelMuted);
             }
 
             applyPreferredVideoLevel() {
@@ -2622,6 +2781,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         ? `${badgeTxt} · ${info.userCount.toLocaleString()}명`
                         : badgeTxt;
                     this.videoPanelEl.title = info.title || "";
+                    this.applyAudioState();
 
                     if (HlsLib && HlsLib.isSupported()) {
                         const hls = new HlsLib({
@@ -3179,7 +3339,42 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const collapseBtn = document.getElementById("btn-tools-collapse");
             const hintEl = document.getElementById("global-tools-hint");
             const hintCloseBtn = document.getElementById("btn-tools-hint-close");
+            const masterMuteBtn = document.getElementById("btn-master-mute");
+            const masterSlider = document.getElementById("master-vol-slider");
             if (!tools) return;
+
+            if (masterMuteBtn) {
+                masterMuteBtn.addEventListener("click", () => {
+                    const currentlyMuted = masterMuted || masterVolume <= 0;
+                    if (currentlyMuted) {
+                        masterMuted = false;
+                        if (masterVolume <= 0) {
+                            masterVolume = masterLastNonZero > 0 ? masterLastNonZero : 50;
+                            localStorage.setItem(MASTER_VOL_KEY, String(masterVolume));
+                        }
+                    } else {
+                        masterMuted = true;
+                    }
+                    localStorage.setItem(MASTER_MUTE_KEY, masterMuted ? "1" : "0");
+                    syncAllClientAudio();
+                });
+            }
+            if (masterSlider) {
+                masterSlider.addEventListener("input", (e) => {
+                    const next = Math.max(0, Math.min(100, Math.round(Number(e.target.value) || 0)));
+                    masterVolume = next;
+                    if (next > 0) {
+                        masterLastNonZero = next;
+                        masterMuted = false;
+                    } else {
+                        masterMuted = true;
+                    }
+                    localStorage.setItem(MASTER_VOL_KEY, String(masterVolume));
+                    localStorage.setItem(MASTER_MUTE_KEY, masterMuted ? "1" : "0");
+                    syncAllClientAudio();
+                });
+            }
+            syncMasterVolumeUI();
 
             let expandNearHover = false;
             function setExpandNearHover(next) {
