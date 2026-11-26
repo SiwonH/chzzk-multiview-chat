@@ -11,7 +11,7 @@ import webbrowser
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-APP_VERSION = "v28"
+APP_VERSION = "v29"
 GITHUB_REPO = "SiwonH/chzzk-multiview-chat"
 GITHUB_ASSET_NAME = "chzzk_chat.py"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=15"
@@ -3677,7 +3677,7 @@ def fetch_available_versions():
         pass
     return versions
 
-def switch_to_version(entry):
+def switch_to_version(entry, is_manual_switch=False):
     """선택한 버전의 스크립트를 내려받아 검증·백업 후 교체하고 재실행합니다."""
     tag = entry["tag"]
     script_path = os.path.abspath(__file__)
@@ -3714,11 +3714,43 @@ def switch_to_version(entry):
     print(f" ✅ {tag} 버전으로 변경 완료! (이전 파일 백업: {os.path.basename(backup_path)})")
     print(" 🔄 새 버전으로 다시 실행합니다...\n")
 
+    next_args = [arg for arg in sys.argv[1:] if arg != "--skip-auto-update"]
+    if is_manual_switch:
+        next_args.append("--skip-auto-update")
+
     if os.name == "nt":
-        rc = subprocess.call([sys.executable, script_path] + sys.argv[1:])
+        rc = subprocess.call([sys.executable, script_path] + next_args)
         sys.exit(rc)
     else:
-        os.execv(sys.executable, [sys.executable, script_path] + sys.argv[1:])
+        os.execv(sys.executable, [sys.executable, script_path] + next_args)
+
+def auto_update_if_needed():
+    """시작 시 더 새로운 GitHub 릴리스가 있으면 묻지 않고 자동 업데이트합니다."""
+    if "--skip-auto-update" in sys.argv[1:]:
+        return False
+
+    newer_tag = check_latest_version(timeout=2.0)
+    if not newer_tag:
+        return False
+
+    print(f" ✨ 새 버전({newer_tag})을 발견했습니다! 자동으로 업데이트합니다...")
+    direct_url = f"https://github.com/{GITHUB_REPO}/releases/download/{newer_tag}/{GITHUB_ASSET_NAME}"
+    if switch_to_version({"tag": newer_tag, "url": direct_url}, is_manual_switch=False):
+        return True
+
+    versions = fetch_available_versions()
+    target_entry = next((v for v in versions if v["tag"] == newer_tag), None)
+    if not target_entry and versions:
+        cand = versions[0]
+        if parse_version_tuple(cand["tag"]) > parse_version_tuple(APP_VERSION):
+            target_entry = cand
+    if target_entry and target_entry["url"] != direct_url:
+        if switch_to_version(target_entry, is_manual_switch=False):
+            return True
+
+    print(" ⚠ 자동 업데이트에 실패해 현재 버전으로 계속 실행합니다.")
+    print("--------------------------------------------------")
+    return False
 
 def run_version_selector():
     """GitHub 버전 목록을 보여주고 사용자가 고른 버전으로 전환합니다."""
@@ -3757,7 +3789,7 @@ def run_version_selector():
             print()
             return
 
-    switch_to_version(chosen)
+    switch_to_version(chosen, is_manual_switch=True)
 
 def run_cookie_manager():
     """터미널에서 네이버 로그인 쿠키(NID_AUT, NID_SES)를 설정하거나 삭제합니다."""
@@ -3790,10 +3822,7 @@ def main():
     print(f" 🎬 치지직 실시간 채팅 멀티뷰 ({APP_VERSION} · 최대 6개)")
     print("==================================================")
 
-    newer_tag = check_latest_version(timeout=2.0)
-    if newer_tag:
-        print(f" ✨ 새 버전({newer_tag})이 있습니다! ('v' 입력으로 확인/업데이트)")
-        print("--------------------------------------------------")
+    auto_update_if_needed()
 
     pt = load_prompt_toolkit()
 
