@@ -1,0 +1,11 @@
+{
+  "latest": "v16",
+  "versions": [
+    {
+      "tag": "v16",
+      "date": "2026-11-26",
+      "note": "GitHub 버전 선택(v) 및 자동 업데이트 추가",
+      "url": "https://github.com/SiwonH/chzzk-multiview-chat/releases/download/v16/chzzk_chat.py"
+    }
+  ]
+}
