@@ -11,7 +11,7 @@ import webbrowser
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-APP_VERSION = "v29"
+APP_VERSION = "v30"
 GITHUB_REPO = "SiwonH/chzzk-multiview-chat"
 GITHUB_ASSET_NAME = "chzzk_chat.py"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=15"
@@ -40,10 +40,46 @@ HEADERS = {
 
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chzzk_history.json")
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chzzk_cookies.json")
+UPDATE_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chzzk_update.json")
 MAX_HISTORY = 9
 history_lock = threading.Lock()
 cookie_lock = threading.Lock()
+update_config_lock = threading.Lock()
 INITIAL_CHANNELS = []
+
+def load_update_config():
+    """자동 업데이트 활성화 여부와 고정 버전 정보를 불러옵니다."""
+    with update_config_lock:
+        if not os.path.exists(UPDATE_CONFIG_FILE):
+            return {"auto_update": True, "pinned_version": ""}
+        try:
+            with open(UPDATE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"auto_update": True, "pinned_version": ""}
+            return {
+                "auto_update": bool(data.get("auto_update", True)),
+                "pinned_version": str(data.get("pinned_version") or "").strip(),
+            }
+        except Exception:
+            return {"auto_update": True, "pinned_version": ""}
+
+def save_update_config(auto_update, pinned_version=""):
+    """자동 업데이트 설정을 로컬 JSON 파일에 저장합니다."""
+    with update_config_lock:
+        try:
+            with open(UPDATE_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "auto_update": bool(auto_update),
+                        "pinned_version": str(pinned_version or "").strip(),
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception:
+            pass
 
 def load_cookies():
     """저장된 네이버 로그인 쿠키(NID_AUT, NID_SES)를 불러옵니다."""
@@ -3677,7 +3713,7 @@ def fetch_available_versions():
         pass
     return versions
 
-def switch_to_version(entry, is_manual_switch=False):
+def switch_to_version(entry, pin_mode=None):
     """선택한 버전의 스크립트를 내려받아 검증·백업 후 교체하고 재실행합니다."""
     tag = entry["tag"]
     script_path = os.path.abspath(__file__)
@@ -3711,13 +3747,17 @@ def switch_to_version(entry, is_manual_switch=False):
         print(f" ❌ 파일 저장 실패: {e}\n")
         return False
 
+    if pin_mode == "auto":
+        save_update_config(True, "")
+        print(" 🔄 최신 버전 선택으로 자동 업데이트가 켜졌습니다.")
+    elif pin_mode == "pin":
+        save_update_config(False, tag)
+        print(f" 📌 {tag} 버전으로 고정되어 자동 업데이트를 껐습니다. (다시 켜려면 'v' → a)")
+
     print(f" ✅ {tag} 버전으로 변경 완료! (이전 파일 백업: {os.path.basename(backup_path)})")
     print(" 🔄 새 버전으로 다시 실행합니다...\n")
 
     next_args = [arg for arg in sys.argv[1:] if arg != "--skip-auto-update"]
-    if is_manual_switch:
-        next_args.append("--skip-auto-update")
-
     if os.name == "nt":
         rc = subprocess.call([sys.executable, script_path] + next_args)
         sys.exit(rc)
@@ -3725,8 +3765,14 @@ def switch_to_version(entry, is_manual_switch=False):
         os.execv(sys.executable, [sys.executable, script_path] + next_args)
 
 def auto_update_if_needed():
-    """시작 시 더 새로운 GitHub 릴리스가 있으면 묻지 않고 자동 업데이트합니다."""
+    """시작 시 자동 업데이트가 켜져 있고 새 GitHub 릴리스가 있으면 즉시 업데이트합니다."""
     if "--skip-auto-update" in sys.argv[1:]:
+        return False
+
+    cfg = load_update_config()
+    if not cfg["auto_update"]:
+        print(f" 📌 자동 업데이트 꺼짐 ({APP_VERSION} 고정 중 · 'v' 메뉴에서 변경 가능)")
+        print("--------------------------------------------------")
         return False
 
     newer_tag = check_latest_version(timeout=2.0)
@@ -3735,7 +3781,7 @@ def auto_update_if_needed():
 
     print(f" ✨ 새 버전({newer_tag})을 발견했습니다! 자동으로 업데이트합니다...")
     direct_url = f"https://github.com/{GITHUB_REPO}/releases/download/{newer_tag}/{GITHUB_ASSET_NAME}"
-    if switch_to_version({"tag": newer_tag, "url": direct_url}, is_manual_switch=False):
+    if switch_to_version({"tag": newer_tag, "url": direct_url}):
         return True
 
     versions = fetch_available_versions()
@@ -3745,7 +3791,7 @@ def auto_update_if_needed():
         if parse_version_tuple(cand["tag"]) > parse_version_tuple(APP_VERSION):
             target_entry = cand
     if target_entry and target_entry["url"] != direct_url:
-        if switch_to_version(target_entry, is_manual_switch=False):
+        if switch_to_version(target_entry):
             return True
 
     print(" ⚠ 자동 업데이트에 실패해 현재 버전으로 계속 실행합니다.")
@@ -3760,8 +3806,11 @@ def run_version_selector():
         print(" ❌ 버전 목록을 가져오지 못했습니다. (네트워크 또는 GitHub 저장소 확인)\n")
         return
 
+    cfg = load_update_config()
+    auto_txt = "켜짐" if cfg["auto_update"] else f"꺼짐 ({cfg['pinned_version'] or APP_VERSION} 고정)"
+
     print("--------------------------------------------------")
-    print(f" 📦 GitHub 버전 목록 (현재 실행 중: {APP_VERSION})")
+    print(f" 📦 GitHub 버전 목록 (현재: {APP_VERSION} · 자동 업데이트: {auto_txt})")
     for idx, v in enumerate(versions, 1):
         cur_mark = " (현재)" if v["tag"] == APP_VERSION else ""
         date_part = f" - {v['date']}" if v["date"] else ""
@@ -3769,9 +3818,19 @@ def run_version_selector():
         print(f"   [{idx}] {v['tag']}{cur_mark}{date_part}{note_part}")
     print("--------------------------------------------------")
 
-    choice = input("👉 변경할 버전 번호 (엔터 = 취소): ").strip()
+    choice = input("👉 변경할 버전 번호 (a = 자동 업데이트 켜기/끄기, 엔터 = 취소): ").strip()
     if not choice:
         print()
+        return
+    if choice.lower() == "a":
+        next_auto = not cfg["auto_update"]
+        save_update_config(next_auto, "" if next_auto else APP_VERSION)
+        if next_auto:
+            print("\n ✅ 자동 업데이트를 켰습니다.")
+            auto_update_if_needed()
+            print()
+        else:
+            print(f"\n 📌 자동 업데이트를 껐습니다. ({APP_VERSION} 고정)\n")
         return
     if not choice.isdigit():
         print("\n ❌ 숫자를 입력해 주세요.\n")
@@ -3783,13 +3842,17 @@ def run_version_selector():
         return
 
     chosen = versions[idx]
+    max_tuple = max(parse_version_tuple(v["tag"]) for v in versions)
+    is_latest_pick = parse_version_tuple(chosen["tag"]) >= max_tuple
+    pin_mode = "auto" if is_latest_pick else "pin"
+
     if chosen["tag"] == APP_VERSION:
         ans = input(f" 이미 {APP_VERSION} 버전입니다. 다시 내려받아 덮어쓸까요? (y/N): ").strip().lower()
         if ans != "y":
             print()
             return
 
-    switch_to_version(chosen, is_manual_switch=True)
+    switch_to_version(chosen, pin_mode=pin_mode)
 
 def run_cookie_manager():
     """터미널에서 네이버 로그인 쿠키(NID_AUT, NID_SES)를 설정하거나 삭제합니다."""
