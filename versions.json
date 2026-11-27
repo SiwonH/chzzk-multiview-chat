@@ -1,6 +1,12 @@
 {
-  "latest": "v34",
+  "latest": "v51",
   "versions": [
+    {
+      "tag": "v51",
+      "date": "2026-11-28",
+      "note": "시청 모드(다중 분할·채팅 오버레이·통합 채팅·창모드/전체화면), 라디오 모드(오디오 전용·우측 상단 배지·채널 이동), 타임머신/미세 싱크 및 좌측 모드 전환 탭 추가",
+      "url": "https://github.com/SiwonH/chzzk-multiview-chat/releases/download/v51/chzzk_chat.py"
+    },
     {
       "tag": "v34",
       "date": "2026-11-26",

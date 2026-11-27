@@ -11,7 +11,7 @@ import webbrowser
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-APP_VERSION = "v34"
+APP_VERSION = "v51"
 GITHUB_REPO = "SiwonH/chzzk-multiview-chat"
 GITHUB_ASSET_NAME = "chzzk_chat.py"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=15"
@@ -25,6 +25,7 @@ GITHUB_HEADERS = {
 SEARCH_URL = "https://api.chzzk.naver.com/service/v1/search/channels"
 CHANNEL_INFO_URL = "https://api.chzzk.naver.com/service/v1/channels/{}"
 LIVE_DETAIL_URL = "https://api.chzzk.naver.com/service/v3/channels/{}/live-detail"
+LIVE_PLAYBACK_URL = "https://api.chzzk.naver.com/service/v1/channels/{}/live-playback-json"
 STATUS_URL = "https://api.chzzk.naver.com/polling/v2/channels/{}/live-status"
 TOKEN_URL = "https://comm-api.game.naver.com/nng_main/v1/chats/access-token?channelId={}&chatType=STREAMING"
 
@@ -124,7 +125,7 @@ def get_cookie_status():
     return {"hasCookie": has_cookie, "nidAutPreview": preview}
 
 def sanitize_channels(channels):
-    """채널 목록에서 중복과 잘못된 항목을 정리해 최대 6개까지 반환합니다."""
+    """채널 목록에서 중복과 잘못된 항목을 정리해 반환합니다."""
     if not isinstance(channels, list):
         return []
     cleaned = []
@@ -137,12 +138,43 @@ def sanitize_channels(channels):
         if cid and cname and cid not in seen:
             seen.add(cid)
             cleaned.append({"id": cid, "name": cname})
-        if len(cleaned) >= 6:
-            break
     return cleaned
 
+def normalize_history_entry(item):
+    """구형(리스트) 및 신형(딕셔너리) 기록 항목을 공통 형식으로 정규화합니다."""
+    if isinstance(item, list):
+        cleaned = sanitize_channels(item)
+        return {"channels": cleaned, "pinned": False} if cleaned else None
+    if isinstance(item, dict):
+        cleaned = sanitize_channels(item.get("channels"))
+        if not cleaned:
+            return None
+        return {"channels": cleaned, "pinned": bool(item.get("pinned", False))}
+    return None
+
+def sort_and_trim_history(entries):
+    """고정(📌) 항목은 상단에 보존하고 일반 기록만 최대 개수 내로 유지합니다."""
+    pinned = []
+    unpinned = []
+    seen_keys = set()
+    for raw in entries:
+        entry = normalize_history_entry(raw)
+        if not entry:
+            continue
+        key = tuple(ch["id"] for ch in entry["channels"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        if entry["pinned"]:
+            pinned.append(entry)
+        else:
+            unpinned.append(entry)
+    pinned = pinned[:MAX_HISTORY]
+    avail_unpinned = max(0, MAX_HISTORY - len(pinned))
+    return pinned + unpinned[:avail_unpinned]
+
 def load_history():
-    """저장된 최근 스트리머 조합 목록을 불러옵니다."""
+    """저장된 스크립트 최근 스트리머 조합 목록을 불러옵니다."""
     with history_lock:
         if not os.path.exists(HISTORY_FILE):
             return []
@@ -151,39 +183,56 @@ def load_history():
                 data = json.load(f)
             if not isinstance(data, list):
                 return []
-            result = []
-            for entry in data:
-                cleaned = sanitize_channels(entry)
-                if cleaned:
-                    result.append(cleaned)
-                if len(result) >= MAX_HISTORY:
-                    break
-            return result
+            return sort_and_trim_history(data)
         except Exception:
             return []
 
 def save_history(history):
     """기록 목록을 JSON 파일에 저장합니다."""
+    normalized = sort_and_trim_history(history or [])
     with history_lock:
         try:
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(history[:MAX_HISTORY], f, ensure_ascii=False, indent=2)
+                json.dump(normalized, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+    return normalized
 
 def record_history_entry(channels):
-    """선택/편성한 채널 조합을 기록 맨 앞(1번)에 저장합니다."""
+    """CLI 스크립트에서 입력한 채널 조합을 최근 기록에 저장합니다. (고정 상태 보존)"""
     cleaned = sanitize_channels(channels)
     if not cleaned:
-        return
+        return load_history()
     key = tuple(ch["id"] for ch in cleaned)
     history = load_history()
-    filtered = [entry for entry in history if tuple(ch["id"] for ch in entry) != key]
-    save_history([cleaned] + filtered)
+    was_pinned = False
+    new_entries = []
+    for entry in history:
+        if tuple(ch["id"] for ch in entry["channels"]) == key:
+            was_pinned = entry["pinned"]
+            continue
+        new_entries.append(entry)
+    new_entry = {"channels": cleaned, "pinned": was_pinned}
+    if was_pinned:
+        # 고정된 항목은 상단 고정 영역의 첫 자리에 갱신해 유지
+        return save_history([new_entry] + new_entries)
+    pinned_part = [e for e in new_entries if e["pinned"]]
+    unpinned_part = [e for e in new_entries if not e["pinned"]]
+    return save_history(pinned_part + [new_entry] + unpinned_part)
+
+def toggle_history_pin(index):
+    """지정 인덱스의 기록 고정(📌) 여부를 전환하고 갱신된 목록을 반환합니다."""
+    history = load_history()
+    if 0 <= index < len(history):
+        history[index]["pinned"] = not history[index]["pinned"]
+        return save_history(history)
+    return history
 
 def request_json(url, use_cookies=False):
     headers = dict(HEADERS)
     if use_cookies:
+        headers["Origin"] = "https://chzzk.naver.com"
+        headers["Referer"] = "https://chzzk.naver.com/"
         cookies = load_cookies()
         parts = []
         if cookies.get("NID_AUT"):
@@ -317,25 +366,76 @@ def get_stream_info(channel_id):
             return {"status": status, "error": msg}
 
         playback = json.loads(playback_raw) if isinstance(playback_raw, str) else playback_raw
+        time_machine = bool((playback.get("live") or {}).get("timeMachine"))
+
+        try:
+            pb_data = request_json(LIVE_PLAYBACK_URL.format(channel_id), use_cookies=True)
+            pb_content = pb_data.get("content") or {}
+            tm_raw = pb_content.get("playbackJson")
+            tm_parsed = json.loads(tm_raw) if isinstance(tm_raw, str) else tm_raw
+            if isinstance(tm_parsed, dict) and (tm_parsed.get("media") or []):
+                playback = tm_parsed
+                time_machine = bool(pb_content.get("tmp")) or bool((tm_parsed.get("live") or {}).get("timeMachine"))
+        except Exception:
+            pass
+
         media_list = (playback or {}).get("media") or []
+        auth_type = ((playback or {}).get("meta") or {}).get("playbackAuthType") or ""
+
+        def extract_seg_auth(media_obj, url_str):
+            cp = (media_obj or {}).get("contentProtection") or {}
+            if not cp and auth_type != "SMP_ADVANCED_SEGMENT":
+                return None, None
+            t_name = str(cp.get("suTokenName") or "").strip() or "__bgda__"
+            q_dict = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url_str).query))
+            t_val = q_dict.get("hdnts") or ""
+            return (t_name, t_val) if t_val else (None, None)
+
+        def is_audio_only_media(media_obj):
+            if not isinstance(media_obj, dict):
+                return False
+            mid = str(media_obj.get("mediaId") or "").upper()
+            if media_obj.get("audioOnly") is True or "AUDIO" in mid:
+                return True
+            tracks = media_obj.get("encodingTrack") or []
+            dict_tracks = [t for t in tracks if isinstance(t, dict)]
+            return bool(dict_tracks) and all(t.get("audioOnly") is True for t in dict_tracks)
 
         llhls_url = None
+        llhls_media = None
         hls_url = None
+        hls_media = None
+        audio_url = None
+        audio_media = None
         for m in media_list:
             mid = m.get("mediaId")
             path = m.get("path")
             if not path:
                 continue
+            if is_audio_only_media(m):
+                if not audio_url:
+                    audio_url = path
+                    audio_media = m
+                continue
             if mid == "LLHLS" and not llhls_url:
                 llhls_url = path
+                llhls_media = m
             elif mid == "HLS" and not hls_url:
                 hls_url = path
+                hls_media = m
             elif m.get("protocol") == "HLS" and not hls_url:
                 hls_url = path
+                hls_media = m
 
         primary_url = llhls_url or hls_url
+        primary_media = llhls_media if llhls_url else hls_media
         if not primary_url:
             return {"status": status, "error": "HLS 스트림 주소를 찾지 못했습니다."}
+
+        seg_tok_name, seg_tok_val = extract_seg_auth(primary_media, primary_url)
+        fallback_url = hls_url if (llhls_url and hls_url and hls_url != llhls_url) else None
+        fb_tok_name, fb_tok_val = extract_seg_auth(hls_media, fallback_url) if fallback_url else (None, None)
+        audio_tok_name, audio_tok_val = extract_seg_auth(audio_media, audio_url) if audio_url else (None, None)
 
         return {
             "status": status,
@@ -343,11 +443,19 @@ def get_stream_info(channel_id):
             "category": category,
             "userCount": user_count,
             "hlsUrl": primary_url,
-            "hlsFallbackUrl": hls_url if (llhls_url and hls_url and hls_url != llhls_url) else None,
+            "hlsFallbackUrl": fallback_url,
+            "audioOnlyUrl": audio_url,
             "isLowLatency": bool(llhls_url),
+            "timeMachine": time_machine,
+            "segTokenName": seg_tok_name,
+            "segTokenVal": seg_tok_val,
+            "fallbackSegTokenName": fb_tok_name,
+            "fallbackSegTokenVal": fb_tok_val,
+            "audioOnlySegTokenName": audio_tok_name,
+            "audioOnlySegTokenVal": audio_tok_val,
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "retryable": True}
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ko">
@@ -373,6 +481,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             width: 100vw;
             height: 100vh;
             overflow: hidden;
+        }
+        body:not(.focus-mode).hscroll-mode .wrapper {
+            overflow-x: auto;
+            overflow-y: hidden;
+        }
+        body:not(.focus-mode).hscroll-mode .wrapper::-webkit-scrollbar { height: 7px; }
+        body:not(.focus-mode).hscroll-mode .wrapper::-webkit-scrollbar-track { background: #111115; }
+        body:not(.focus-mode).hscroll-mode .wrapper::-webkit-scrollbar-thumb { background: #3f3f4a; border-radius: 4px; }
+        body:not(.focus-mode).hscroll-mode .wrapper::-webkit-scrollbar-thumb:hover { background: #00ffa3; }
+        .global-header-tools .btn-mini.toggle-on {
+            border-color: rgba(0, 255, 163, 0.65);
+            color: #00ffa3;
+            background: rgba(0, 255, 163, 0.16);
         }
         .empty-screen {
             display: flex;
@@ -700,6 +821,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background: rgba(11, 11, 14, 0.85);
             pointer-events: none;
         }
+        .video-msg.is-retryable {
+            pointer-events: auto;
+            cursor: pointer;
+            color: #f4f4f6;
+        }
+        .video-msg.is-retryable:hover {
+            color: #00ffa3;
+        }
         .video-msg.hidden { display: none; }
         .video-overlay {
             position: absolute;
@@ -707,38 +836,172 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             right: 0;
             bottom: 0;
             display: flex;
+            flex-direction: row;
             align-items: center;
             justify-content: space-between;
             gap: 6px;
             padding: 14px 8px 6px;
-            background: linear-gradient(transparent, rgba(0, 0, 0, 0.84));
+            background: linear-gradient(transparent, rgba(0, 0, 0, 0.86));
             opacity: 0;
             transition: opacity 0.15s;
+        }
+        .video-tm-bar {
+            display: none;
+            flex: 1 1 auto;
+            min-width: 0;
+            align-items: center;
+            gap: 5px;
+            margin: 0 4px;
+        }
+        body.focus-mode .video-panel.has-timemachine .video-tm-bar {
+            display: flex;
+        }
+        .video-tm-slider-wrap {
+            position: relative;
+            flex: 1 1 auto;
+            min-width: 48px;
+            display: flex;
+            align-items: center;
+        }
+        .video-tm-slider {
+            width: 100%;
+            height: 5px;
+            margin: 0;
+        }
+        .video-tm-tooltip {
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 3px 7px;
+            border-radius: 5px;
+            background: rgba(14, 14, 20, 0.96);
+            border: 1px solid rgba(0, 255, 163, 0.55);
+            color: #f4f4f6;
+            font-size: 11px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.72);
+            z-index: 25;
+        }
+        .video-tm-tooltip.hidden { display: none; }
+        .video-tm-time {
+            font-size: 11px;
+            color: #e4e4e7;
+            min-width: 44px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            flex-shrink: 0;
+            user-select: none;
+        }
+        .btn-tm-live {
+            font-weight: 700;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .btn-tm-live.is-live {
+            color: #00ffa3;
+            border-color: rgba(0, 255, 163, 0.55);
+            background: rgba(0, 255, 163, 0.14);
+        }
+        .btn-tm-live:not(.is-live) {
+            color: #facc15;
+            border-color: rgba(250, 204, 21, 0.6);
+            background: rgba(250, 204, 21, 0.18);
         }
         .video-panel:hover .video-overlay { opacity: 1; }
         .video-info-badge {
             position: absolute;
             top: 8px;
             left: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
             font-size: 10px;
             color: #e4e4e7;
-            background: rgba(20, 20, 26, 0.82);
+            background: rgba(16, 16, 22, 0.84);
             border: 1px solid #34343f;
-            border-radius: 4px;
-            padding: 2px 6px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
+            border-radius: 5px;
+            padding: 3px 7px;
             max-width: calc(100% - 16px);
             opacity: 0;
             pointer-events: none;
-            transition: opacity 0.15s;
+            transition: opacity 0.2s;
+            z-index: 15;
         }
-        .video-panel:hover .video-info-badge { opacity: 1; }
+        .video-badge-meta {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #a1a1aa;
+            font-weight: 600;
+        }
+        .video-badge-title {
+            display: none;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: #f4f4f6;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        body.focus-mode .video-info-badge {
+            max-width: min(62%, 560px);
+            padding: 5px 9px;
+            border-color: rgba(255, 255, 255, 0.14);
+            pointer-events: auto;
+            cursor: pointer;
+            transition: opacity 0.2s, border-color 0.15s, background-color 0.15s;
+        }
+        body.focus-mode .video-info-badge:hover {
+            border-color: rgba(0, 255, 163, 0.72);
+            background: rgba(20, 22, 30, 0.94);
+        }
+        body.focus-mode .video-badge-meta { font-size: 11px; color: #00ffa3; }
+        body.focus-mode .video-badge-title.has-title { display: block; }
+        body.focus-mode .video-panel:hover .video-info-badge { opacity: 1; }
+        body.focus-mode.focus-split-active .video-info-badge {
+            cursor: pointer;
+        }
+        body.focus-mode.focus-split-active .video-info-badge:active {
+            cursor: grabbing;
+        }
+        body.focus-mode.focus-split-active .video-badge-meta[data-order]::before {
+            content: "#" attr(data-order) " · ";
+            color: #fde047;
+            font-weight: 800;
+        }
+        body.focus-mode .video-panel.drag-over {
+            outline: 2px solid #00ffa3;
+            outline-offset: -2px;
+        }
+        .video-swipe-hud {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 32;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: rgba(12, 12, 18, 0.9);
+            border: 1px solid rgba(0, 255, 163, 0.65);
+            color: #f4f4f6;
+            font-size: 12.5px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            pointer-events: none;
+            box-shadow: 0 8px 22px rgba(0, 0, 0, 0.78);
+        }
+        .video-swipe-hud.hidden { display: none; }
         .video-overlay-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
         .video-vol-wrap {
             display: inline-flex;
             align-items: center;
+            flex-shrink: 0;
         }
         .vol-slider {
             appearance: none;
@@ -790,11 +1053,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             pointer-events: auto;
             margin: 0 2px 0 4px;
         }
-        body.focus-mode .chat-box.is-focused .video-vol-slider {
-            width: 78px;
+        body.focus-mode .video-vol-slider {
+            width: 66px;
             opacity: 1;
             pointer-events: auto;
-            margin: 0 3px 0 4px;
+            margin: 0 2px 0 4px;
         }
         .btn-video-ctrl {
             background: rgba(24, 24, 30, 0.9);
@@ -825,30 +1088,539 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             overflow: hidden;
         }
 
-        /* 더블클릭 전체화면 집중 모드 (큰 영상 + 해당 방송 채팅) */
+        /* 더블클릭 전체화면 집중 모드 (영상 그리드 + 선택/합치기 채팅) */
+        .focus-video-stage {
+            display: none;
+            position: relative;
+            flex: 1 1 auto;
+            min-width: 0;
+            height: 100vh;
+            background: #000;
+            overflow: hidden;
+        }
+        .focus-video-grid {
+            display: grid;
+            width: 100%;
+            height: 100%;
+            gap: 2px;
+            background: #0b0b0e;
+        }
+        .focus-video-hud {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 40;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            gap: 5px;
+            max-width: calc(100% - 24px);
+            padding: 5px 7px;
+            border-radius: 10px;
+            background: rgba(14, 14, 20, 0.78);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            backdrop-filter: blur(6px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.24s ease;
+        }
+        .focus-video-stage.top-hud-active .focus-video-hud {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        body.focus-mode .focus-video-grid .video-panel.badge-yield-top .video-info-badge {
+            top: var(--badge-yield-top, 46px);
+        }
+        .focus-hud-chip.fs-btn {
+            padding: 0 7px;
+        }
+        .focus-hud-chip.fs-btn.active {
+            background: rgba(192, 132, 252, 0.22);
+            border-color: #c084fc;
+            color: #e9d5ff;
+        }
+        .focus-hud-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            height: 24px;
+            padding: 0 9px;
+            border-radius: 999px;
+            border: 1px solid #35394b;
+            background: rgba(24, 26, 36, 0.9);
+            color: #cbd5e1;
+            font-size: 11.5px;
+            font-weight: 600;
+            cursor: pointer;
+            max-width: 132px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            transition: border-color 0.15s, background 0.15s, color 0.15s;
+        }
+        .focus-hud-chip:hover { border-color: #94a3b8; color: #fff; }
+        .focus-hud-chip.active {
+            background: rgba(0, 255, 163, 0.18);
+            border-color: rgba(0, 255, 163, 0.72);
+            color: #00ffa3;
+        }
+        .focus-hud-chip.audio-only {
+            background: rgba(56, 189, 248, 0.18);
+            border-color: rgba(56, 189, 248, 0.75);
+            color: #7dd3fc;
+        }
+        .focus-hud-chip.audio-only.is-muted {
+            background: rgba(148, 163, 184, 0.14);
+            border-color: rgba(148, 163, 184, 0.45);
+            color: #94a3b8;
+        }
+        .focus-audio-sink {
+            position: fixed;
+            left: 0;
+            bottom: 0;
+            width: 1px;
+            height: 1px;
+            opacity: 0.001;
+            pointer-events: none;
+            overflow: hidden;
+            z-index: -1;
+        }
+        .focus-radio-dock {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            z-index: 38;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            gap: 7px;
+            max-width: min(45%, 360px);
+            pointer-events: none;
+            transition: top 0.18s ease;
+        }
+        .focus-radio-dock:empty { display: none; }
+        .focus-radio-circle {
+            position: relative;
+            width: 38px;
+            height: 38px;
+            padding: 0 2px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(14, 16, 24, 0.56);
+            border: 1.5px solid var(--room-color, #38bdf8);
+            color: #f4f4f6;
+            font-size: 10.5px;
+            font-weight: 800;
+            line-height: 1.05;
+            letter-spacing: -0.02em;
+            backdrop-filter: blur(4px);
+            opacity: 0.78;
+            cursor: pointer;
+            pointer-events: auto;
+            user-select: none;
+            box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+            transition: opacity 0.15s ease, transform 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+        }
+        .focus-radio-circle:hover {
+            opacity: 1;
+            background: rgba(18, 22, 32, 0.9);
+            transform: scale(1.06);
+        }
+        .focus-radio-circle.is-muted {
+            opacity: 0.45;
+            border-style: dashed;
+            border-color: #64748b;
+            color: #94a3b8;
+        }
+        .focus-radio-circle.is-muted:hover {
+            opacity: 0.85;
+            color: #e2e8f0;
+        }
+        .focus-radio-circle-name {
+            max-width: 100%;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: clip;
+        }
+        .focus-radio-circle-mute {
+            position: absolute;
+            right: -3px;
+            bottom: -3px;
+            font-size: 9px;
+            line-height: 1;
+            background: rgba(14, 16, 24, 0.92);
+            border: 1px solid #475569;
+            border-radius: 999px;
+            padding: 1px 2px;
+        }
+        .focus-hud-chip.active[draggable="true"] { cursor: grab; }
+        .focus-hud-chip.drag-over {
+            border-color: #fde047;
+            box-shadow: 0 0 0 1px #fde047;
+        }
+        .focus-hud-chip.overlay-btn.active {
+            background: rgba(96, 165, 250, 0.22);
+            border-color: #60a5fa;
+            color: #93c5fd;
+        }
+        .focus-hud-chip.style-btn {
+            padding: 0 7px;
+        }
+        .focus-hud-chip.style-btn.active {
+            background: rgba(250, 204, 21, 0.18);
+            border-color: rgba(250, 204, 21, 0.72);
+            color: #fde047;
+        }
+        .focus-overlay-popover {
+            display: none;
+            position: absolute;
+            top: 48px;
+            right: 10px;
+            z-index: 45;
+            min-width: 242px;
+            padding: 9px 11px;
+            border-radius: 10px;
+            background: rgba(16, 18, 26, 0.96);
+            border: 1px solid rgba(0, 255, 163, 0.45);
+            box-shadow: 0 10px 26px rgba(0, 0, 0, 0.78);
+            backdrop-filter: blur(8px);
+            flex-direction: column;
+            gap: 8px;
+        }
+        .focus-overlay-popover.open {
+            display: flex;
+        }
+        body.focus-mode.focus-chat-overlay .focus-overlay-popover {
+            right: calc(var(--focus-chat-width, clamp(250px, 18vw, 330px)) + 16px);
+        }
+        .focus-overlay-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .focus-overlay-label {
+            font-size: 11.5px;
+            font-weight: 600;
+            color: #e4e4e7;
+            min-width: 64px;
+        }
+        .focus-overlay-row .vol-slider {
+            flex: 1 1 auto;
+            min-width: 90px;
+        }
+        .focus-overlay-val {
+            font-size: 11px;
+            font-variant-numeric: tabular-nums;
+            color: #00ffa3;
+            min-width: 38px;
+            text-align: right;
+        }
+        body.focus-mode.focus-chat-overlay .focus-video-stage {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused {
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 50;
+            background: transparent;
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .chat-pane {
+            background: var(--focus-overlay-chat-bg, rgba(11, 11, 16, 0.55));
+            backdrop-filter: blur(var(--focus-overlay-blur, 3.8px));
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .focus-chat-bar {
+            background: var(--focus-overlay-bar-bg, rgba(16, 18, 26, 0.67));
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .pinned-panel {
+            background: var(--focus-overlay-pin-bg, rgba(14, 16, 24, 0.61));
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .pinned-header {
+            background: var(--focus-overlay-pinhead-bg, rgba(20, 23, 34, 0.72));
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .focus-resizer {
+            background-color: rgba(31, 34, 46, 0.45);
+            border-color: rgba(255, 255, 255, 0.14);
+        }
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .msg-row .nickname,
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .msg-row .msg-text,
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .msg-donation .donation-header,
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .msg-system,
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .pinned-item .nickname,
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .pinned-item .msg-text,
+        body.focus-mode.focus-chat-overlay .chat-box.is-focused .pinned-item .pin-time {
+            paint-order: stroke fill;
+            -webkit-text-stroke: var(--focus-text-stroke, 1.5px rgba(0, 0, 0, 0.94));
+            text-shadow: var(--focus-text-shadow, 0 1px 3.3px rgba(0, 0, 0, 0.96), 0 0 2.1px rgba(0, 0, 0, 0.85));
+        }
+        body.focus-mode.focus-chat-overlay .focus-video-hud,
+        body.focus-mode.focus-chat-overlay .focus-radio-dock {
+            right: calc(var(--focus-chat-width, clamp(250px, 18vw, 330px)) + 16px);
+            max-width: calc(100% - var(--focus-chat-width, clamp(250px, 18vw, 330px)) - 28px);
+        }
+        body.focus-mode.focus-chat-overlay .focus-video-grid .video-panel.focus-right-col .video-overlay {
+            padding-right: calc(var(--focus-chat-width, clamp(250px, 18vw, 330px)) + 16px);
+        }
+        body.focus-mode.focus-chat-overlay .focus-video-grid.focus-dense-right .video-panel.focus-right-col .video-overlay {
+            flex-wrap: wrap;
+            row-gap: 4px;
+        }
+        body.focus-mode.focus-chat-overlay .focus-video-grid .video-panel.focus-right-col .video-info-badge {
+            max-width: calc(100% - var(--focus-chat-width, clamp(250px, 18vw, 330px)) - 24px);
+        }
+        body.focus-mode.focus-chat-overlay.alt-passthrough .chat-box.is-focused,
+        body.focus-mode.focus-chat-overlay.alt-passthrough .chat-box.is-focused * {
+            pointer-events: none !important;
+        }
+        body.focus-mode.focus-chat-overlay.alt-passthrough .chat-box.is-focused .chat-pane {
+            opacity: 0.42;
+            outline: 1px dashed rgba(0, 255, 163, 0.55);
+            outline-offset: -1px;
+        }
+        .mode-dock-wrap {
+            position: fixed;
+            top: 58px;
+            left: 0;
+            z-index: 90;
+            display: inline-flex;
+            flex-direction: row;
+            align-items: stretch;
+            height: 76px;
+            box-sizing: border-box;
+            padding: 0;
+            border-radius: 0 10px 10px 0;
+            background: rgba(20, 20, 28, 0.95);
+            border: 1px solid rgba(0, 255, 163, 0.45);
+            border-left: none;
+            box-shadow: 4px 6px 18px rgba(0, 0, 0, 0.68);
+            transition: background-color 0.2s, border-color 0.2s, box-shadow 0.2s;
+        }
+        .mode-dock-wrap.is-hidden { display: none !important; }
+        .mode-dock-wrap.is-collapsed {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+        }
+        .mode-dock-wrap:not(.is-collapsed):hover,
+        .mode-dock-wrap:not(.is-collapsed):focus-within,
+        .mode-dock-wrap.intro-spotlight {
+            background: rgba(22, 22, 30, 0.98);
+            border-color: #00ffa3;
+            box-shadow: 4px 8px 24px rgba(0, 0, 0, 0.78);
+        }
+        .mode-dock-wrap.intro-spotlight {
+            animation: modeIntroPulse 1.4s ease-out 3;
+        }
+        @keyframes modeIntroPulse {
+            0% { box-shadow: 0 0 0 0 rgba(0, 255, 163, 0.6), 4px 8px 24px rgba(0, 0, 0, 0.78); }
+            70% { box-shadow: 0 0 0 10px rgba(0, 255, 163, 0), 4px 8px 24px rgba(0, 0, 0, 0.78); }
+            100% { box-shadow: 0 0 0 0 rgba(0, 255, 163, 0), 4px 8px 24px rgba(0, 0, 0, 0.78); }
+        }
+        .mode-dock-expanded {
+            display: inline-flex;
+            align-items: stretch;
+            height: 100%;
+        }
+        .mode-dock-inner {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 5px;
+            padding: 6px 7px;
+            height: 100%;
+            box-sizing: border-box;
+        }
+        .mode-dock-wrap.is-collapsed .mode-dock-expanded {
+            display: none;
+        }
+        .btn-mode-expand-tab {
+            display: none;
+            width: 10px;
+            min-width: 10px;
+            height: 76px;
+            box-sizing: border-box;
+            border-radius: 0 8px 8px 0;
+            background: rgba(22, 22, 30, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-left: none;
+            color: rgba(212, 212, 216, 0.75);
+            font-size: 9px;
+            opacity: 0.45;
+            box-shadow: none;
+        }
+        .btn-mode-expand-tab:hover,
+        .btn-mode-expand-tab.near-hover {
+            width: 24px;
+            min-width: 24px;
+            opacity: 1;
+            background: rgba(24, 26, 36, 0.98);
+            border-color: #00ffa3;
+            color: #00ffa3;
+            font-size: 11px;
+            box-shadow: 3px 4px 12px rgba(0, 0, 0, 0.6);
+        }
+        .mode-dock-wrap.is-collapsed .btn-mode-expand-tab {
+            display: inline-flex;
+        }
+        .btn-mode-collapse-tab {
+            width: 14px;
+            min-width: 14px;
+            height: 100%;
+            font-size: 10px;
+            border-radius: 0 9px 9px 0;
+            background: rgba(255, 255, 255, 0.04);
+            border: none;
+            border-left: 1px solid rgba(255, 255, 255, 0.14);
+            color: #a1a1aa;
+        }
+        .btn-mode-collapse-tab:hover {
+            width: 18px;
+            min-width: 18px;
+            background: rgba(0, 255, 163, 0.18);
+            color: #00ffa3;
+        }
+        .mode-dock-btn {
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.04);
+            color: #cbd5e1;
+            font-size: 11.5px;
+            font-weight: 700;
+            padding: 4px 10px;
+            border-radius: 7px;
+            cursor: pointer;
+            white-space: nowrap;
+            text-align: left;
+            transition: background-color 0.14s, color 0.14s, border-color 0.14s;
+        }
+        .mode-dock-btn:hover {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.25);
+        }
+        .mode-dock-btn.active {
+            background: rgba(0, 255, 163, 0.18);
+            border-color: rgba(0, 255, 163, 0.7);
+            color: #00ffa3;
+        }
+        .mode-dock-hint {
+            position: absolute;
+            top: calc(100% + 12px);
+            left: 12px;
+            width: min(276px, calc(100vw - 28px));
+            background: rgba(16, 18, 24, 0.98);
+            color: #e4e4e7;
+            border: 2px solid #00ffa3;
+            border-radius: 12px;
+            padding: 13px 15px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.85), 0 0 18px rgba(0, 255, 163, 0.25);
+            pointer-events: none;
+            opacity: 0;
+            transform: translateY(-6px);
+            transition: opacity 0.28s, transform 0.28s;
+            cursor: pointer;
+        }
+        .mode-dock-hint::before {
+            content: "";
+            position: absolute;
+            top: -8px;
+            left: 22px;
+            width: 12px;
+            height: 12px;
+            background: rgba(16, 18, 24, 0.98);
+            border-left: 2px solid #00ffa3;
+            border-top: 2px solid #00ffa3;
+            transform: rotate(45deg);
+        }
+        .mode-dock-hint-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 14px;
+            font-weight: 800;
+            color: #00ffa3;
+        }
+        .mode-dock-hint-body {
+            margin-top: 6px;
+            font-size: 12.5px;
+            line-height: 1.5;
+            color: #f4f4f6;
+        }
+        .mode-dock-hint-sub {
+            margin-top: 5px;
+            font-size: 11.5px;
+            line-height: 1.4;
+            color: #9ca3af;
+        }
+        .mode-dock-wrap.intro-spotlight .mode-dock-hint {
+            opacity: 1;
+            transform: translateY(0);
+            pointer-events: auto;
+        }
+        body.focus-mode {
+            display: flex;
+            flex-direction: row;
+        }
+        body.focus-mode .focus-video-stage {
+            display: block;
+        }
         body.focus-mode .wrapper {
             display: flex;
+            flex: 0 0 auto;
+            width: auto;
+            overflow: visible;
         }
         body.focus-mode .chat-box:not(.is-focused) {
             display: none !important;
         }
         body.focus-mode .chat-box.is-focused {
-            flex: 1 1 auto;
-            width: 100vw;
+            flex: 0 0 auto;
+            width: auto;
             height: 100vh;
             border-right: none;
+        }
+        body.focus-mode .chat-box.is-focused > .header {
+            display: none;
         }
         body.focus-mode .chat-box.is-focused .col-body {
             flex-direction: row;
         }
-        body.focus-mode .chat-box.is-focused .video-panel {
-            flex: 1 1 auto;
-            width: auto;
+        body.focus-mode .chat-box > .col-body > .video-panel {
+            display: none !important;
+        }
+        body.focus-mode .focus-video-grid .video-panel {
+            width: 100%;
             height: 100%;
             max-height: none;
             aspect-ratio: auto;
             border-bottom: none;
             border-right: none;
+        }
+        /* 전체화면 아이들 상태 시 모든 영상 UI 숨김 */
+        body.focus-mode .focus-video-stage:not(.hud-active) .video-overlay,
+        body.focus-mode .focus-video-stage:not(.hud-active) .video-info-badge {
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
+        body.focus-mode .focus-video-stage.hud-active .focus-video-grid[data-count="1"] .video-panel .video-overlay,
+        body.focus-mode .focus-video-stage.hud-active .focus-video-grid[data-count="1"] .video-panel .video-info-badge {
+            opacity: 1;
+        }
+        body.focus-mode .focus-video-stage.hud-active .focus-video-grid:not([data-count="1"]) .video-panel:not(:hover) .video-overlay,
+        body.focus-mode .focus-video-stage.hud-active .focus-video-grid:not([data-count="1"]) .video-panel:not(:hover) .video-info-badge {
+            opacity: 0;
+        }
+        body.focus-mode .focus-video-stage.hud-active .focus-video-grid:not([data-count="1"]) .video-panel:hover .video-overlay,
+        body.focus-mode .focus-video-stage.hud-active .focus-video-grid:not([data-count="1"]) .video-panel:hover .video-info-badge {
+            opacity: 1;
         }
         .focus-resizer {
             display: none;
@@ -1050,6 +1822,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             background: #262632;
             margin: 4px 2px;
         }
+        .context-menu-vol-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px 4px;
+            color: #cbd5e1;
+            font-size: 11px;
+        }
+        .context-menu-vol-slider {
+            width: 96px;
+            flex: 1 1 auto;
+        }
+        .context-menu-vol-val {
+            min-width: 34px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            color: #00ffa3;
+            font-weight: 700;
+        }
 
         /* 스트리머 편집/검색 모달 */
         .modal-backdrop {
@@ -1122,6 +1913,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             padding: 6px 8px; border-radius: 6px;
         }
         .history-row:hover { border-color: #343444; }
+        .history-row.pinned {
+            border-color: rgba(0, 255, 163, 0.45);
+            background: rgba(0, 255, 163, 0.05);
+        }
+        .btn-history-pin.pinned {
+            color: #00ffa3;
+            border-color: rgba(0, 255, 163, 0.6);
+            background: rgba(0, 255, 163, 0.14);
+        }
         .history-idx {
             font-size: 11px; font-weight: bold; color: #00ffa3;
             flex-shrink: 0; min-width: 22px;
@@ -1202,10 +2002,269 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             cursor: pointer;
         }
         .btn-secondary:hover { border-color: #ff6b6b; color: #ff6b6b; }
+        .undo-toast {
+            position: fixed;
+            left: 50%;
+            bottom: 20px;
+            transform: translate(-50%, 14px);
+            z-index: 95;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            background: rgba(18, 18, 26, 0.96);
+            border: 1px solid rgba(0, 255, 163, 0.55);
+            color: #f4f4f6;
+            font-size: 12.5px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.72);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s, transform 0.2s;
+        }
+        .undo-toast.visible {
+            opacity: 1;
+            transform: translate(-50%, 0);
+            pointer-events: auto;
+        }
+        .undo-toast-btn {
+            background: rgba(0, 255, 163, 0.14);
+            color: #00ffa3;
+            border: 1px solid rgba(0, 255, 163, 0.5);
+            border-radius: 999px;
+            padding: 2px 9px;
+            font-size: 11.5px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .undo-toast-btn:hover {
+            background: #00ffa3;
+            color: #0b0b0e;
+        }
+        .video-sync-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            flex-shrink: 0;
+        }
+        .btn-video-ctrl.btn-sync-step {
+            padding: 2px 4px;
+            font-size: 10.5px;
+            font-variant-numeric: tabular-nums;
+        }
+        .video-sync-badge {
+            font-size: 10px;
+            color: #facc15;
+            background: rgba(250, 204, 21, 0.14);
+            border: 1px solid rgba(250, 204, 21, 0.45);
+            border-radius: 4px;
+            padding: 1px 4px;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            cursor: pointer;
+            user-select: none;
+        }
+        .video-sync-badge.adjusting {
+            color: #00ffa3;
+            border-color: rgba(0, 255, 163, 0.55);
+            background: rgba(0, 255, 163, 0.14);
+        }
+        .video-sync-badge.hidden { display: none; }
+        .focus-chat-bar-wrap {
+            display: none;
+            position: relative;
+            flex: 0 0 32px;
+            height: 32px;
+            z-index: 30;
+        }
+        body.focus-mode .chat-box.is-focused .focus-chat-bar-wrap {
+            display: block;
+        }
+        .focus-chat-bar {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            align-content: flex-start;
+            row-gap: 6px;
+            column-gap: 4px;
+            padding: 5px 8px;
+            min-height: 32px;
+            max-height: 32px;
+            overflow: hidden;
+            background: #151720;
+            border-bottom: 1px solid #262938;
+            transition: max-height 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+        }
+        .focus-chat-bar-wrap.has-overflow .focus-chat-bar {
+            padding-right: 22px;
+        }
+        .focus-chat-bar-wrap.has-overflow:hover .focus-chat-bar,
+        .focus-chat-bar-wrap.has-overflow:focus-within .focus-chat-bar {
+            max-height: 180px;
+            padding-right: 8px;
+            background: rgba(21, 23, 32, 0.98);
+            border-bottom-color: rgba(0, 255, 163, 0.45);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.72);
+        }
+        .focus-chat-more {
+            display: none;
+            position: absolute;
+            top: 5px;
+            right: 6px;
+            height: 22px;
+            line-height: 22px;
+            font-size: 11px;
+            color: #9ca3af;
+            pointer-events: none;
+            z-index: 31;
+            transition: opacity 0.12s ease;
+        }
+        .focus-chat-bar-wrap.has-overflow .focus-chat-more {
+            display: inline-block;
+        }
+        .focus-chat-bar-wrap.has-overflow:hover .focus-chat-more,
+        .focus-chat-bar-wrap.has-overflow:focus-within .focus-chat-more {
+            opacity: 0;
+        }
+        .focus-chat-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            height: 22px;
+            box-sizing: border-box;
+            background: #1f222e;
+            color: #cbd5e1;
+            border: 1px solid #323648;
+            border-radius: 999px;
+            padding: 0 7px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            max-width: 114px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            transition: border-color 0.15s, background 0.15s, color 0.15s;
+        }
+        .focus-chat-chip:hover {
+            border-color: #64748b;
+            color: #fff;
+        }
+        .focus-chat-chip.active {
+            background: rgba(0, 255, 163, 0.14);
+            border-color: rgba(0, 255, 163, 0.65);
+            color: #00ffa3;
+        }
+        .focus-chat-chip.merge-btn.active {
+            background: rgba(96, 165, 250, 0.18);
+            border-color: #60a5fa;
+            color: #93c5fd;
+        }
+        .focus-chat-chip.pin-btn {
+            padding: 0 6px;
+            font-size: 11px;
+        }
+        .focus-room-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .focus-pinned-panel,
+        .focus-inner-resizer,
+        .focus-messages-wrap {
+            display: none !important;
+        }
+        .chat-pane.focus-custom-active > .pinned-panel:not(.focus-pinned-panel),
+        .chat-pane.focus-custom-active > .resizer:not(.focus-inner-resizer),
+        .chat-pane.focus-custom-active > .messages-wrap:not(.focus-messages-wrap) {
+            display: none !important;
+        }
+        body.focus-mode .chat-box.is-focused .chat-pane.focus-custom-active > .focus-pinned-panel {
+            display: flex !important;
+        }
+        body.focus-mode .chat-box.is-focused .chat-pane.focus-custom-active > .focus-pinned-panel.hidden {
+            display: none !important;
+        }
+        body.focus-mode .chat-box.is-focused .chat-pane.focus-custom-active > .focus-inner-resizer {
+            display: block !important;
+        }
+        body.focus-mode .chat-box.is-focused .chat-pane.focus-custom-active > .focus-inner-resizer.hidden {
+            display: none !important;
+        }
+        body.focus-mode .chat-box.is-focused .chat-pane.focus-custom-active > .focus-messages-wrap {
+            display: flex !important;
+        }
+        .room-tag {
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 1.25;
+            padding: 1px 5px;
+            margin-right: 5px;
+            border-radius: 4px;
+            vertical-align: middle;
+            max-width: 58px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid var(--room-color, #00ffa3);
+            color: var(--room-color, #00ffa3);
+        }
     </style>
 </head>
 <body>
+    <div class="focus-video-stage" id="focus-video-stage">
+        <div class="focus-video-grid" id="focus-video-grid" data-count="1"></div>
+        <div class="focus-audio-sink" id="focus-audio-sink" aria-hidden="true"></div>
+        <div class="focus-radio-dock" id="focus-radio-dock" aria-label="라디오 재생 중 방송"></div>
+        <div class="focus-video-hud" id="focus-video-hud" aria-label="전체화면 스트림 선택"></div>
+        <div class="focus-overlay-popover" id="focus-overlay-popover" aria-label="채팅 오버레이 설정">
+            <div class="focus-overlay-row">
+                <span class="focus-overlay-label">배경 투명도</span>
+                <input type="range" class="vol-slider" id="overlay-alpha-slider" min="0" max="90" step="5" value="55">
+                <span class="focus-overlay-val" id="overlay-alpha-val">55%</span>
+            </div>
+            <div class="focus-overlay-row">
+                <span class="focus-overlay-label">글자 테두리</span>
+                <input type="range" class="vol-slider" id="overlay-stroke-slider" min="0" max="4" step="0.5" value="1.5">
+                <span class="focus-overlay-val" id="overlay-stroke-val">1.5px</span>
+            </div>
+        </div>
+    </div>
     <div class="wrapper" id="wrapper"></div>
+    <!-- 좌측 화면 모드 전환 탭 -->
+    <div class="mode-dock-wrap is-hidden is-collapsed" id="mode-dock-wrap" aria-label="화면 모드 전환">
+        <div class="mode-dock-expanded" id="mode-dock-expanded">
+            <div class="mode-dock-inner">
+                <button type="button" class="mode-dock-btn active" id="btn-mode-chat" title="세로 분할 멀티 채팅 기본 화면">💬 채팅 모드</button>
+                <button type="button" class="mode-dock-btn" id="btn-mode-watch" title="영상 중심 시청 모드 (분할·오버레이)">📺 시청 모드</button>
+            </div>
+            <button type="button" class="btn-tools-handle btn-mode-collapse-tab" id="btn-mode-collapse" title="모드 탭 접기">◀</button>
+        </div>
+        <button type="button" class="btn-tools-handle btn-mode-expand-tab" id="btn-mode-expand" title="화면 모드 전환 (채팅 · 시청) 펼치기">▶</button>
+        <div class="mode-dock-hint" id="mode-dock-hint" title="클릭하면 닫히고 탭이 접힙니다">
+            <div class="mode-dock-hint-head">
+                <span>🔄 채팅 · 시청 모드 전환</span>
+                <button type="button" class="global-tools-hint-close" id="btn-mode-hint-close" title="닫기">✕</button>
+            </div>
+            <div class="mode-dock-hint-body">
+                멀티 채팅 화면과 영상 중심 시청 모드를 여기서 한 번에 전환할 수 있어요.
+            </div>
+            <div class="mode-dock-hint-sub">
+                잠시 후 왼쪽 끝 얇은 <b>[▶]</b> 버튼으로 접히며, 눌러서 언제든 다시 펼칠 수 있습니다.
+            </div>
+        </div>
+    </div>
+    <div class="undo-toast" id="undo-toast" role="status" aria-live="polite">
+        <span id="undo-toast-msg"></span>
+        <button type="button" class="undo-toast-btn" id="undo-toast-btn" style="display:none;">Ctrl+Z 되돌리기</button>
+    </div>
 
     <!-- 전역 컨트롤 묶음 -->
     <div class="global-header-tools" id="global-tools">
@@ -1216,6 +2275,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="global-tools-section" aria-label="관리 및 인증">
                     <button class="btn-mini btn-tools-primary" id="btn-manage-streamers" title="스트리머 추가 및 편성 관리 (E)">⚙ 설정</button>
                     <button class="btn-mini btn-cookie" id="btn-cookie-settings" title="네이버 로그인 쿠키 설정 (성인 인증 방송용)">🔑</button>
+                    <button class="btn-mini" id="btn-scroll-mode" title="가로 스크롤 ON/OFF (채널이 많을 때 최소 너비 유지)">↔</button>
                 </div>
                 <div class="global-tools-section" aria-label="글자 크기 조절">
                     <button class="btn-mini" id="btn-font-down" title="글자 작게 (-)">-</button>
@@ -1278,9 +2338,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="context-menu-item" id="hist-ctx-load-combo">
             <span>이 조합 전체 불러오기</span>
         </button>
+        <button class="context-menu-item" id="hist-ctx-toggle-pin">
+            <span id="hist-ctx-pin-label">📌 이 기록 고정</span>
+        </button>
         <div class="context-menu-sep"></div>
         <button class="context-menu-item" id="hist-ctx-delete">
             <span>이 기록 삭제</span>
+        </button>
+    </div>
+
+    <!-- 시청 모드 상단 칩 우클릭 컨텍스트 메뉴 -->
+    <div class="context-menu" id="focus-hud-context-menu" style="z-index: 300;">
+        <div class="context-menu-header" id="hud-ctx-title">방송 설정</div>
+        <button class="context-menu-item" id="hud-ctx-video">
+            <span id="hud-ctx-video-label">📺 영상 켜기</span>
+            <span class="context-menu-shortcut" id="hud-ctx-video-hint">좌클릭</span>
+        </button>
+        <button class="context-menu-item" id="hud-ctx-radio">
+            <span id="hud-ctx-radio-label">🎧 소리만 켜기 (라디오)</span>
+            <span class="context-menu-shortcut" id="hud-ctx-radio-hint">오디오 전용</span>
+        </button>
+        <div class="context-menu-sep"></div>
+        <button class="context-menu-item" id="hud-ctx-mute">
+            <span id="hud-ctx-mute-label">🔊 음소거</span>
+            <span class="context-menu-shortcut" id="hud-ctx-mute-hint"></span>
+        </button>
+        <div class="context-menu-vol-row" id="hud-ctx-vol-row">
+            <span>볼륨</span>
+            <input type="range" class="vol-slider context-menu-vol-slider" id="hud-ctx-vol-slider" min="0" max="100" value="50">
+            <span class="context-menu-vol-val" id="hud-ctx-vol-val">50%</span>
+        </div>
+        <div class="context-menu-sep"></div>
+        <button class="context-menu-item" id="hud-ctx-open-live">
+            <span>↗ 해당 채널로 이동</span>
+            <span class="context-menu-shortcut">새 탭</span>
         </button>
     </div>
 
@@ -1336,8 +2427,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             <div id="active-section">
                 <div class="active-section-title">
-                    <span>현재 표시 중인 채널 (최대 6개)</span>
-                    <span id="active-count-label">0 / 6</span>
+                    <span>현재 표시 중인 채널</span>
+                    <span id="active-count-label">0개</span>
                 </div>
                 <div class="active-list" id="active-list"></div>
             </div>
@@ -1383,6 +2474,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.getElementById("btn-font-down").onclick = () => applyFontSize(currentFontSize - 1);
         document.getElementById("btn-font-up").onclick = () => applyFontSize(currentFontSize + 1);
+
+        const HSCROLL_MODE_KEY = "chzzk_hscroll_mode";
+        let isHScrollMode = localStorage.getItem(HSCROLL_MODE_KEY) === "1";
+        const scrollModeBtn = document.getElementById("btn-scroll-mode");
+
+        function applyHScrollMode(enabled, persist = true, relayout = true) {
+            isHScrollMode = !!enabled;
+            document.body.classList.toggle("hscroll-mode", isHScrollMode);
+            if (scrollModeBtn) {
+                scrollModeBtn.classList.toggle("toggle-on", isHScrollMode);
+                scrollModeBtn.title = isHScrollMode
+                    ? "가로 스크롤 켜짐 (클릭: 한 화면에 균등 분할)"
+                    : "가로 스크롤 꺼짐 (클릭: 최소 너비 유지 + 가로 스크롤)";
+            }
+            if (persist) {
+                localStorage.setItem(HSCROLL_MODE_KEY, isHScrollMode ? "1" : "0");
+            }
+            if (relayout && typeof syncLayout === "function") {
+                syncLayout();
+            }
+        }
+        if (scrollModeBtn) {
+            scrollModeBtn.onclick = () => applyHScrollMode(!isHScrollMode, true, true);
+            applyHScrollMode(isHScrollMode, false, false);
+        }
 
         // PC 네트워크 복구 시 끊어져 있던 방 즉시 재연결
         window.addEventListener("online", () => {
@@ -1442,14 +2558,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const pickOneLabel = document.getElementById("hist-ctx-pick-one-label");
             const titleEl = document.getElementById("hist-ctx-title");
             const loadComboBtn = document.getElementById("hist-ctx-load-combo");
+            const pinLabel = document.getElementById("hist-ctx-pin-label");
+            const entry = modalHistory[comboIdx];
 
             if (histCtxTargetChannel) {
                 titleEl.textContent = `${histCtxTargetChannel.name} · 기록 #${comboIdx + 1}`;
                 pickOneLabel.textContent = "이 스트리머 추가";
                 pickOneBtn.style.display = "flex";
             } else {
-                titleEl.textContent = `최근 조합 #${comboIdx + 1}`;
+                titleEl.textContent = `스크립트 기록 #${comboIdx + 1}`;
                 pickOneBtn.style.display = "none";
+            }
+            if (pinLabel) {
+                pinLabel.textContent = entry && entry.pinned ? "📌 고정 해제" : "📌 이 기록 고정";
             }
             loadComboBtn.style.display = "flex";
 
@@ -1472,6 +2593,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("hist-ctx-load-combo").onclick = () => {
             if (histCtxTargetComboIdx >= 0) {
                 applyComboFromHistory(histCtxTargetComboIdx);
+            }
+            closeHistoryContextMenu();
+        };
+
+        document.getElementById("hist-ctx-toggle-pin").onclick = () => {
+            if (histCtxTargetComboIdx >= 0) {
+                toggleHistoryPin(histCtxTargetComboIdx);
             }
             closeHistoryContextMenu();
         };
@@ -1510,12 +2638,123 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             closePinContextMenu();
         };
 
+        const hudCtxMenuEl = document.getElementById("focus-hud-context-menu");
+        let hudCtxChannelId = null;
+        let hudCtxSource = "hud";
+
+        function refreshHudContextMenu() {
+            if (!hudCtxMenuEl || !hudCtxChannelId) return;
+            const c = clientMap.get(hudCtxChannelId);
+            if (!c || c.isDestroyed) {
+                closeHudContextMenu();
+                return;
+            }
+            const isVideoOn = focusActiveVideoIds.includes(hudCtxChannelId);
+            const isAudioOn = focusAudioOnlyIds.includes(hudCtxChannelId);
+            const isSelfMuted = c.isChannelMuted || c.channelVolume <= 0;
+
+            document.getElementById("hud-ctx-title").textContent =
+                `${c.channel.name} · ${isVideoOn ? "영상" : (isAudioOn ? "라디오" : "대기")}`;
+            document.getElementById("hud-ctx-video-label").textContent =
+                isVideoOn ? "📺 영상 끄기" : (isAudioOn ? "📺 영상으로 전환" : "📺 영상 켜기");
+            document.getElementById("hud-ctx-radio-label").textContent =
+                isAudioOn ? "🎧 라디오 끄기" : "🎧 소리만 켜기 (라디오)";
+            document.getElementById("hud-ctx-mute-label").textContent =
+                isSelfMuted ? "🔊 음소거 해제" : "🔇 이 방송 음소거";
+
+            const videoHintEl = document.getElementById("hud-ctx-video-hint");
+            const radioHintEl = document.getElementById("hud-ctx-radio-hint");
+            const muteHintEl = document.getElementById("hud-ctx-mute-hint");
+            if (videoHintEl) {
+                videoHintEl.textContent = (hudCtxSource === "hud" && !isAudioOn) ? "좌클릭" : (isAudioOn ? "전환" : "");
+            }
+            if (radioHintEl) {
+                radioHintEl.textContent = (hudCtxSource === "hud" && isAudioOn) ? "좌클릭" : "오디오 전용";
+            }
+            if (muteHintEl) {
+                muteHintEl.textContent = hudCtxSource === "circle" ? "좌클릭" : "";
+            }
+
+            const slider = document.getElementById("hud-ctx-vol-slider");
+            const valEl = document.getElementById("hud-ctx-vol-val");
+            if (slider) slider.value = String(isSelfMuted ? 0 : c.channelVolume);
+            if (valEl) valEl.textContent = isSelfMuted ? "음소거" : `${c.channelVolume}%`;
+        }
+
+        function openHudContextMenu(e, channelId, sourceType = "hud") {
+            if (!hudCtxMenuEl || !focusedClient) return;
+            e.preventDefault();
+            e.stopPropagation();
+            hudCtxChannelId = channelId;
+            hudCtxSource = sourceType;
+            refreshHudContextMenu();
+            positionContextMenu(hudCtxMenuEl, e);
+            wakeFocusHud();
+            if (sourceType === "hud") wakeTopHud(3000);
+        }
+
+        function closeHudContextMenu() {
+            if (hudCtxMenuEl) hudCtxMenuEl.classList.remove("open");
+            hudCtxChannelId = null;
+        }
+
+        if (hudCtxMenuEl) {
+            hudCtxMenuEl.addEventListener("click", (e) => e.stopPropagation());
+            hudCtxMenuEl.addEventListener("mousedown", (e) => e.stopPropagation());
+            document.getElementById("hud-ctx-video").onclick = () => {
+                const cid = hudCtxChannelId;
+                closeHudContextMenu();
+                if (!cid || !focusedClient) return;
+                const c = clientMap.get(cid);
+                if (!c || c.isDestroyed) return;
+                if (focusActiveVideoIds.includes(cid)) {
+                    removeStreamFromFocus(c);
+                } else {
+                    addStreamToFocus(c, false);
+                }
+            };
+            document.getElementById("hud-ctx-radio").onclick = () => {
+                const cid = hudCtxChannelId;
+                closeHudContextMenu();
+                if (cid) toggleFocusAudioStream(cid);
+            };
+            document.getElementById("hud-ctx-mute").onclick = () => {
+                if (!hudCtxChannelId) return;
+                const c = clientMap.get(hudCtxChannelId);
+                if (c && !c.isDestroyed) {
+                    c.toggleVideoMute();
+                    refreshHudContextMenu();
+                }
+            };
+            document.getElementById("hud-ctx-open-live").onclick = () => {
+                const cid = hudCtxChannelId;
+                closeHudContextMenu();
+                if (cid) {
+                    window.open(`https://chzzk.naver.com/live/${cid}`, "_blank", "noopener");
+                }
+            };
+            const hudVolSlider = document.getElementById("hud-ctx-vol-slider");
+            if (hudVolSlider) {
+                hudVolSlider.addEventListener("input", (e) => {
+                    if (!hudCtxChannelId) return;
+                    const c = clientMap.get(hudCtxChannelId);
+                    if (c && !c.isDestroyed) {
+                        c.setChannelVolume(e.target.value);
+                        refreshHudContextMenu();
+                    }
+                });
+            }
+        }
+
         window.addEventListener("click", (e) => {
             if (!contextMenuEl.contains(e.target)) {
                 closePinContextMenu();
             }
             if (!historyCtxMenuEl.contains(e.target)) {
                 closeHistoryContextMenu();
+            }
+            if (hudCtxMenuEl && !hudCtxMenuEl.contains(e.target)) {
+                closeHudContextMenu();
             }
         });
         window.addEventListener("contextmenu", (e) => {
@@ -1525,14 +2764,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!e.target.closest(".history-row")) {
                 closeHistoryContextMenu();
             }
+            if (hudCtxMenuEl && !e.target.closest(".focus-hud-chip.stream-chip, .focus-radio-circle") && !hudCtxMenuEl.contains(e.target)) {
+                closeHudContextMenu();
+            }
         });
         window.addEventListener("blur", () => {
             closePinContextMenu();
             closeHistoryContextMenu();
+            closeHudContextMenu();
         });
         window.addEventListener("resize", () => {
             closePinContextMenu();
             closeHistoryContextMenu();
+            closeHudContextMenu();
         });
 
         const MASTER_VOL_KEY = "chzzk_master_volume";
@@ -1571,77 +2815,1133 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         function syncAllClientAudio() {
             syncMasterVolumeUI();
             clientMap.forEach(c => c.applyAudioState());
+            if (focusedClient) {
+                renderFocusVideoHud();
+                renderFocusRadioDock();
+            }
         }
 
+        const FOCUS_ROOM_COLORS = ["#00ffa3", "#60a5fa", "#f472b6", "#facc15", "#c084fc", "#fb923c"];
+        const focusVideoStageEl = document.getElementById("focus-video-stage");
+        const focusVideoGridEl = document.getElementById("focus-video-grid");
+        const focusAudioSinkEl = document.getElementById("focus-audio-sink");
+        const focusRadioDockEl = document.getElementById("focus-radio-dock");
+        const focusVideoHudEl = document.getElementById("focus-video-hud");
+        const focusOverlayPopoverEl = document.getElementById("focus-overlay-popover");
+        const overlayAlphaSliderEl = document.getElementById("overlay-alpha-slider");
+        const overlayAlphaValEl = document.getElementById("overlay-alpha-val");
+        const overlayStrokeSliderEl = document.getElementById("overlay-stroke-slider");
+        const overlayStrokeValEl = document.getElementById("overlay-stroke-val");
         let focusedClient = null;
         let focusPrevFullscreen = false;
         let focusSuspendedClients = [];
-        let focusPrevQuality = 360;
-        let focusPrevMuted = true;
+        let focusActiveVideoIds = [];
+        let focusAudioOnlyIds = [];
+        const FOCUS_CHAT_OVERLAY_KEY = "chzzk_focus_chat_overlay";
+        const FOCUS_OVERLAY_ALPHA_KEY = "chzzk_focus_overlay_alpha";
+        const FOCUS_OVERLAY_STROKE_KEY = "chzzk_focus_overlay_stroke";
+        const FOCUS_PRESET_KEY = "chzzk_focus_preset";
+        const focusStreamSavedStates = new Map();
+        let focusHudTimer = null;
+        let focusTopHudTimer = null;
+        let focusChatOverlay = localStorage.getItem(FOCUS_CHAT_OVERLAY_KEY) === "1";
+        let focusOverlayAlphaPct = loadSavedPct(FOCUS_OVERLAY_ALPHA_KEY, 55);
+        focusOverlayAlphaPct = Math.max(0, Math.min(90, focusOverlayAlphaPct));
+        const savedStrokeRaw = Number(localStorage.getItem(FOCUS_OVERLAY_STROKE_KEY));
+        let focusOverlayStrokePx = Number.isFinite(savedStrokeRaw) ? Math.max(0, Math.min(4, savedStrokeRaw)) : 1.5;
+        let dragSourceFocusId = null;
+        let lastFocusAutoTier = null;
+        let focusRestoring = false;
         let focusExiting = false;
+        let focusChatMerged = false;
+        let focusChatSelectedIds = [];
+        let focusPendingMainQueue = [];
+        let focusPendingPinQueue = [];
+        let _needScrollFocusMain = false;
+        let _needScrollFocusPin = false;
+
+        function applyFocusOverlayStyle(alphaPct = focusOverlayAlphaPct, strokePx = focusOverlayStrokePx, persist = true) {
+            focusOverlayAlphaPct = Math.max(0, Math.min(90, Math.round(Number(alphaPct) || 0)));
+            const parsedStroke = Number(strokePx);
+            focusOverlayStrokePx = Number.isFinite(parsedStroke) ? Math.max(0, Math.min(4, Math.round(parsedStroke * 2) / 2)) : 1.5;
+
+            const a = focusOverlayAlphaPct / 100;
+            const root = document.documentElement;
+            root.style.setProperty("--focus-overlay-chat-bg", `rgba(11, 11, 16, ${a.toFixed(2)})`);
+            root.style.setProperty("--focus-overlay-bar-bg", `rgba(16, 18, 26, ${(a <= 0 ? 0 : Math.min(0.92, a + 0.12)).toFixed(2)})`);
+            root.style.setProperty("--focus-overlay-pin-bg", `rgba(14, 16, 24, ${(a <= 0 ? 0 : Math.min(0.88, a + 0.06)).toFixed(2)})`);
+            root.style.setProperty("--focus-overlay-pinhead-bg", `rgba(20, 23, 34, ${(a <= 0 ? 0 : Math.min(0.94, a + 0.15)).toFixed(2)})`);
+            root.style.setProperty("--focus-overlay-blur", a <= 0 ? "0px" : `${(a * 7).toFixed(1)}px`);
+
+            if (focusOverlayStrokePx > 0) {
+                const s = focusOverlayStrokePx;
+                root.style.setProperty("--focus-text-stroke", `${s}px rgba(0, 0, 0, 0.94)`);
+                root.style.setProperty("--focus-text-shadow", `0 1px ${(s * 2.2).toFixed(1)}px rgba(0, 0, 0, 0.96), 0 0 ${(s * 1.4).toFixed(1)}px rgba(0, 0, 0, 0.85)`);
+            } else {
+                root.style.setProperty("--focus-text-stroke", "0px transparent");
+                root.style.setProperty("--focus-text-shadow", "none");
+            }
+
+            if (overlayAlphaSliderEl) overlayAlphaSliderEl.value = String(focusOverlayAlphaPct);
+            if (overlayAlphaValEl) overlayAlphaValEl.textContent = `${focusOverlayAlphaPct}%`;
+            if (overlayStrokeSliderEl) overlayStrokeSliderEl.value = String(focusOverlayStrokePx);
+            if (overlayStrokeValEl) overlayStrokeValEl.textContent = focusOverlayStrokePx === 0 ? "없음" : `${focusOverlayStrokePx}px`;
+
+            if (persist) {
+                localStorage.setItem(FOCUS_OVERLAY_ALPHA_KEY, String(focusOverlayAlphaPct));
+                localStorage.setItem(FOCUS_OVERLAY_STROKE_KEY, String(focusOverlayStrokePx));
+            }
+        }
+        applyFocusOverlayStyle(focusOverlayAlphaPct, focusOverlayStrokePx, false);
+
+        if (overlayAlphaSliderEl) {
+            overlayAlphaSliderEl.oninput = (e) => {
+                applyFocusOverlayStyle(Number(e.target.value), focusOverlayStrokePx, true);
+                wakeFocusHud();
+            };
+        }
+        if (overlayStrokeSliderEl) {
+            overlayStrokeSliderEl.oninput = (e) => {
+                applyFocusOverlayStyle(focusOverlayAlphaPct, Number(e.target.value), true);
+                wakeFocusHud();
+            };
+        }
+
+        function closeFocusOverlayPopover() {
+            if (focusOverlayPopoverEl) focusOverlayPopoverEl.classList.remove("open");
+            const styleBtn = focusVideoHudEl?.querySelector(".focus-hud-chip.style-btn");
+            if (styleBtn) styleBtn.classList.remove("active");
+        }
+
+        function loadSavedFocusPreset() {
+            try {
+                const raw = JSON.parse(localStorage.getItem(FOCUS_PRESET_KEY) || "null");
+                if (!raw || typeof raw !== "object") return null;
+                const rawMuted = (raw.mutedById && typeof raw.mutedById === "object") ? raw.mutedById : {};
+                const mutedById = {};
+                for (const k of Object.keys(rawMuted)) {
+                    if (typeof rawMuted[k] === "boolean") mutedById[k] = rawMuted[k];
+                }
+                return {
+                    videoIds: Array.isArray(raw.videoIds) ? raw.videoIds.filter(Boolean) : [],
+                    audioOnlyIds: Array.isArray(raw.audioOnlyIds) ? raw.audioOnlyIds.filter(Boolean) : [],
+                    chatMerged: !!raw.chatMerged,
+                    chatSelectedIds: Array.isArray(raw.chatSelectedIds) ? raw.chatSelectedIds.filter(Boolean) : [],
+                    mutedById,
+                };
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function saveCurrentFocusPreset() {
+            if (!focusedClient || focusExiting || focusRestoring) return;
+            try {
+                const prevMutedMap = loadSavedFocusPreset()?.mutedById || {};
+                const mutedById = { ...prevMutedMap };
+                [...focusActiveVideoIds, ...focusAudioOnlyIds].forEach((cid) => {
+                    const c = clientMap.get(cid);
+                    if (c && !c.isDestroyed) {
+                        mutedById[cid] = !!c.isChannelMuted;
+                    }
+                });
+                const payload = {
+                    videoIds: focusActiveVideoIds.slice(),
+                    audioOnlyIds: focusAudioOnlyIds.slice(),
+                    chatMerged: !!focusChatMerged,
+                    chatSelectedIds: focusChatSelectedIds.slice(),
+                    mutedById,
+                };
+                localStorage.setItem(FOCUS_PRESET_KEY, JSON.stringify(payload));
+            } catch (e) {}
+        }
+
+        function getFocusAutoQuality(count) {
+            if (count <= 1) return 0;     // 1분할: 원본
+            if (count <= 4) return 720;   // 2~4분할: 720p
+            return 480;                   // 5분할+(6분할): 480p
+        }
+
+        function syncTopHudClearance() {
+            if (!focusedClient || !focusVideoStageEl || !focusVideoHudEl || !focusVideoGridEl) return;
+            const isTopVisible = focusVideoStageEl.classList.contains("top-hud-active");
+            const panels = focusVideoGridEl.querySelectorAll(".video-panel");
+            if (!isTopVisible) {
+                panels.forEach(p => p.classList.remove("badge-yield-top"));
+                if (focusRadioDockEl) focusRadioDockEl.style.top = "";
+                return;
+            }
+            const hudRect = focusVideoHudEl.getBoundingClientRect();
+            if (focusRadioDockEl) {
+                focusRadioDockEl.style.top = `${Math.max(48, Math.round(hudRect.bottom + 8))}px`;
+            }
+            if (focusOverlayPopoverEl) {
+                focusOverlayPopoverEl.style.top = `${Math.max(46, Math.round(hudRect.bottom + 6))}px`;
+            }
+            panels.forEach((p) => {
+                const pr = p.getBoundingClientRect();
+                const badgeReachRight = Math.min(pr.right, pr.left + Math.min(pr.width * 0.62, 560));
+                const overlapsTopRow = pr.top < hudRect.bottom + 8;
+                const overlapsX = badgeReachRight > hudRect.left - 12 && pr.left < hudRect.right + 12;
+                if (overlapsTopRow && overlapsX) {
+                    const yieldPx = Math.max(44, Math.round(hudRect.bottom - pr.top + 8));
+                    p.style.setProperty("--badge-yield-top", `${yieldPx}px`);
+                    p.classList.add("badge-yield-top");
+                } else {
+                    p.classList.remove("badge-yield-top");
+                }
+            });
+        }
+
+        function wakeTopHud(durationMs = 2000) {
+            if (!focusedClient || !focusVideoStageEl) return;
+            focusVideoStageEl.classList.add("top-hud-active");
+            requestAnimationFrame(syncTopHudClearance);
+            if (focusTopHudTimer) clearTimeout(focusTopHudTimer);
+            focusTopHudTimer = setTimeout(() => {
+                focusTopHudTimer = null;
+                if (!focusedClient || !focusVideoStageEl) return;
+                const keepTop =
+                    (hudCtxMenuEl && hudCtxMenuEl.classList.contains("open") && hudCtxSource === "hud") ||
+                    (focusOverlayPopoverEl && focusOverlayPopoverEl.classList.contains("open")) ||
+                    (focusVideoHudEl && focusVideoHudEl.matches(":hover"));
+                if (keepTop) {
+                    wakeTopHud(1200);
+                    return;
+                }
+                focusVideoStageEl.classList.remove("top-hud-active");
+                syncTopHudClearance();
+            }, durationMs);
+        }
+
+        function wakeFocusHud() {
+            if (!focusedClient || !focusVideoStageEl) return;
+            focusVideoStageEl.classList.add("hud-active");
+            if (focusHudTimer) clearTimeout(focusHudTimer);
+            focusHudTimer = setTimeout(() => {
+                focusHudTimer = null;
+                if (!focusedClient || !focusVideoStageEl) return;
+                const overControls =
+                    (hudCtxMenuEl && hudCtxMenuEl.classList.contains("open")) ||
+                    (focusOverlayPopoverEl && focusOverlayPopoverEl.classList.contains("open")) ||
+                    (focusVideoHudEl && focusVideoHudEl.matches(":hover")) ||
+                    (focusVideoGridEl && Array.from(focusVideoGridEl.querySelectorAll(".video-overlay")).some(el => el.matches(":hover")));
+                if (overControls) {
+                    wakeFocusHud();
+                    return;
+                }
+                focusVideoStageEl.classList.remove("hud-active");
+            }, 2200);
+        }
+
+        if (focusVideoStageEl) {
+            focusVideoStageEl.addEventListener("mousemove", (e) => {
+                wakeFocusHud();
+                if (focusRadioDockEl && focusRadioDockEl.contains(e.target)) return;
+                if (e.clientY <= 84 || (focusVideoHudEl && focusVideoHudEl.contains(e.target))) {
+                    wakeTopHud();
+                }
+            }, { passive: true });
+            ["mousedown", "touchstart"].forEach(evtName => {
+                focusVideoStageEl.addEventListener(evtName, (e) => {
+                    wakeFocusHud();
+                    if (focusRadioDockEl && focusRadioDockEl.contains(e.target)) return;
+                    if ((e.clientY && e.clientY <= 84) || (focusVideoHudEl && focusVideoHudEl.contains(e.target))) {
+                        wakeTopHud();
+                    }
+                }, { passive: true });
+            });
+            focusVideoStageEl.addEventListener("mouseleave", () => {
+                if ((focusOverlayPopoverEl && focusOverlayPopoverEl.classList.contains("open")) ||
+                    (hudCtxMenuEl && hudCtxMenuEl.classList.contains("open"))) return;
+                if (focusHudTimer) {
+                    clearTimeout(focusHudTimer);
+                    focusHudTimer = null;
+                }
+                if (focusTopHudTimer) {
+                    clearTimeout(focusTopHudTimer);
+                    focusTopHudTimer = null;
+                }
+                focusVideoStageEl.classList.remove("hud-active", "top-hud-active");
+                syncTopHudClearance();
+            });
+            window.addEventListener("click", (e) => {
+                if (!focusOverlayPopoverEl || !focusOverlayPopoverEl.classList.contains("open")) return;
+                if (focusOverlayPopoverEl.contains(e.target) || e.target.closest(".focus-hud-chip.style-btn")) return;
+                closeFocusOverlayPopover();
+            });
+        }
+
+        function updateFocusVideoGridLayout() {
+            if (!focusVideoGridEl) return;
+            const n = Math.max(1, focusVideoGridEl.children.length);
+            focusVideoGridEl.setAttribute("data-count", String(n));
+            const cols = Math.ceil(Math.sqrt(n));
+            const rows = Math.ceil(n / cols);
+            focusVideoGridEl.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+            focusVideoGridEl.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+            focusVideoGridEl.classList.toggle("focus-dense-right", cols >= 3);
+            return cols;
+        }
+
+        function layoutFocusVideoPanels() {
+            if (!focusedClient || !focusVideoGridEl) return;
+            const validIds = focusActiveVideoIds.filter(id => {
+                const c = clientMap.get(id);
+                return c && !c.isDestroyed;
+            });
+            focusActiveVideoIds = validIds;
+            const n = validIds.length;
+            const cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, n))));
+
+            document.body.classList.toggle("focus-split-active", n >= 2);
+            document.body.classList.toggle("focus-chat-overlay", !!focusChatOverlay);
+            if (!focusChatOverlay) {
+                document.body.classList.remove("alt-passthrough");
+            }
+
+            const targetQual = getFocusAutoQuality(n);
+            const tierChanged = targetQual !== lastFocusAutoTier;
+            lastFocusAutoTier = targetQual;
+
+            validIds.forEach((cid, idx) => {
+                const c = clientMap.get(cid);
+                const moved = c.videoPanelEl.parentElement !== focusVideoGridEl;
+                focusVideoGridEl.appendChild(c.videoPanelEl);
+                c.videoPanelEl.classList.remove("hidden");
+                c.videoPanelEl.classList.toggle("focus-right-col", (idx % cols) === (cols - 1));
+
+                if (c.videoBadgeEl) {
+                    c.videoBadgeEl.draggable = n >= 2;
+                    c.videoBadgeEl.title = n >= 2
+                        ? "클릭: 치지직 방송 페이지 열기 · 드래그: 화면 순서 바꾸기"
+                        : "클릭: 치지직 방송 페이지 새 탭 열기";
+                }
+                if (c.videoBadgeMetaEl) {
+                    if (n >= 2) {
+                        c.videoBadgeMetaEl.dataset.order = String(idx + 1);
+                    } else {
+                        delete c.videoBadgeMetaEl.dataset.order;
+                    }
+                }
+
+                if (tierChanged && c.preferredQuality !== targetQual) {
+                    c.preferredQuality = targetQual;
+                    c.videoQualBtn.textContent = targetQual === 0 ? "원본" : `${targetQual}p`;
+                    if (c.hls) {
+                        c.applyPreferredVideoLevel(true);
+                    }
+                }
+
+                if (moved && c.isVideoOpen) {
+                    c.videoEl.play().catch(() => {});
+                    requestAnimationFrame(() => {
+                        if (!c.isDestroyed && c.isVideoOpen) {
+                            c.videoEl.play().catch(() => {});
+                        }
+                    });
+                }
+            });
+
+            updateFocusVideoGridLayout();
+            renderFocusVideoHud();
+            requestAnimationFrame(syncTopHudClearance);
+            saveCurrentFocusPreset();
+        }
+
+        function swapFocusStreams(idA, idB) {
+            if (!focusedClient || !idA || !idB || idA === idB) return;
+            const idxA = focusActiveVideoIds.indexOf(idA);
+            const idxB = focusActiveVideoIds.indexOf(idB);
+            if (idxA === -1 || idxB === -1) return;
+            focusActiveVideoIds[idxA] = idB;
+            focusActiveVideoIds[idxB] = idA;
+            layoutFocusVideoPanels();
+            wakeFocusHud();
+        }
+
+        function toggleOsFullscreen() {
+            if (document.fullscreenElement) {
+                if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+            } else if (document.documentElement.requestFullscreen) {
+                document.documentElement.requestFullscreen().catch(() => {});
+            }
+        }
+
+        function renderFocusVideoHud() {
+            if (!focusVideoHudEl) return;
+            focusVideoHudEl.innerHTML = "";
+            if (!focusedClient) return;
+
+            const fsBtn = document.createElement("button");
+            fsBtn.type = "button";
+            const isFsNow = !!document.fullscreenElement;
+            fsBtn.className = `focus-hud-chip fs-btn${isFsNow ? " active" : ""}`;
+            fsBtn.textContent = isFsNow ? "⛶ 창으로" : "⛶ 전체화면";
+            fsBtn.title = "OS 전체화면 켜기/끄기";
+            fsBtn.onclick = (e) => {
+                e.stopPropagation();
+                toggleOsFullscreen();
+            };
+            focusVideoHudEl.appendChild(fsBtn);
+
+            const overlayBtn = document.createElement("button");
+            overlayBtn.type = "button";
+            overlayBtn.className = `focus-hud-chip overlay-btn${focusChatOverlay ? " active" : ""}`;
+            overlayBtn.textContent = "◫ 채팅 오버레이";
+            overlayBtn.title = focusChatOverlay
+                ? "켜짐: 영상을 화면 100%로 깔고 채팅을 반투명 오버레이로 표시 (Alt 홀드: 뒤 클릭)"
+                : "꺼짐: 영상과 채팅을 나란히 배치";
+            overlayBtn.onclick = (e) => {
+                e.stopPropagation();
+                focusChatOverlay = !focusChatOverlay;
+                localStorage.setItem(FOCUS_CHAT_OVERLAY_KEY, focusChatOverlay ? "1" : "0");
+                if (!focusChatOverlay) closeFocusOverlayPopover();
+                layoutFocusVideoPanels();
+                wakeFocusHud();
+            };
+            focusVideoHudEl.appendChild(overlayBtn);
+
+            if (focusChatOverlay) {
+                const isPopOpen = !!(focusOverlayPopoverEl && focusOverlayPopoverEl.classList.contains("open"));
+                const styleBtn = document.createElement("button");
+                styleBtn.type = "button";
+                styleBtn.className = `focus-hud-chip style-btn${isPopOpen ? " active" : ""}`;
+                styleBtn.textContent = "🎨";
+                styleBtn.title = "채팅 오버레이 배경 투명도 · 글자 테두리 설정";
+                styleBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (!focusOverlayPopoverEl) return;
+                    const nextOpen = !focusOverlayPopoverEl.classList.contains("open");
+                    focusOverlayPopoverEl.classList.toggle("open", nextOpen);
+                    styleBtn.classList.toggle("active", nextOpen);
+                    wakeFocusHud();
+                };
+                focusVideoHudEl.appendChild(styleBtn);
+            }
+
+            const isSplit = focusActiveVideoIds.length >= 2;
+            activeChannels.forEach((ch) => {
+                const orderIdx = focusActiveVideoIds.indexOf(ch.id);
+                const isOn = orderIdx !== -1;
+                const isAudioOnly = !isOn && focusAudioOnlyIds.includes(ch.id);
+                const c = clientMap.get(ch.id);
+                const isRadioMuted = !!(c && (c.isChannelMuted || c.channelVolume <= 0 || masterMuted || masterVolume <= 0));
+
+                const chip = document.createElement("button");
+                chip.type = "button";
+                chip.className = `focus-hud-chip stream-chip${isOn ? " active" : ""}${isAudioOnly ? " audio-only" : ""}${isAudioOnly && isRadioMuted ? " is-muted" : ""}`;
+                chip.draggable = isOn && isSplit;
+                if (isOn) {
+                    chip.title = isSplit
+                        ? `'${ch.name}' 좌클릭: 영상 끄기 · 드래그: 순서 바꾸기 · 우클릭: 라디오/볼륨 메뉴`
+                        : `'${ch.name}' 영상 켜짐 · 우클릭: 라디오/볼륨 메뉴`;
+                } else if (isAudioOnly) {
+                    chip.title = `'${ch.name}' 🎧 라디오(소리만) 재생 중 · 좌클릭: 라디오 끄기 · 우클릭: 메뉴(영상 전환/볼륨/이동)`;
+                } else {
+                    chip.title = `'${ch.name}' 좌클릭: 영상 추가 · 우클릭: 🎧 소리만 켜기 / 볼륨`;
+                }
+
+                const dot = document.createElement("span");
+                dot.className = "focus-room-dot";
+                dot.style.backgroundColor = getFocusRoomColor(ch.id);
+
+                const label = document.createElement("span");
+                if (isSplit && isOn) {
+                    label.textContent = `${orderIdx + 1}·${ch.name}`;
+                } else if (isAudioOnly) {
+                    label.textContent = `${isRadioMuted ? "🔇" : "🎧"} ${ch.name}`;
+                } else {
+                    label.textContent = ch.name;
+                }
+
+                chip.appendChild(dot);
+                chip.appendChild(label);
+                chip.onclick = (e) => {
+                    e.stopPropagation();
+                    toggleFocusVideoStream(ch.id);
+                };
+                chip.oncontextmenu = (e) => {
+                    openHudContextMenu(e, ch.id);
+                };
+                if (isOn && isSplit) {
+                    chip.addEventListener("dragstart", (e) => {
+                        dragSourceFocusId = ch.id;
+                        if (e.dataTransfer) {
+                            e.dataTransfer.effectAllowed = "move";
+                            e.dataTransfer.setData("text/plain", ch.id);
+                        }
+                    });
+                    chip.addEventListener("dragover", (e) => {
+                        if (dragSourceFocusId && dragSourceFocusId !== ch.id) {
+                            e.preventDefault();
+                            chip.classList.add("drag-over");
+                        }
+                    });
+                    chip.addEventListener("dragleave", () => {
+                        chip.classList.remove("drag-over");
+                    });
+                    chip.addEventListener("drop", (e) => {
+                        e.preventDefault();
+                        chip.classList.remove("drag-over");
+                        const srcId = dragSourceFocusId || e.dataTransfer?.getData("text/plain");
+                        dragSourceFocusId = null;
+                        if (srcId && srcId !== ch.id) {
+                            swapFocusStreams(srcId, ch.id);
+                        }
+                    });
+                    chip.addEventListener("dragend", () => {
+                        dragSourceFocusId = null;
+                        chip.classList.remove("drag-over");
+                    });
+                }
+                focusVideoHudEl.appendChild(chip);
+            });
+            renderFocusRadioDock();
+        }
+
+        function renderFocusRadioDock() {
+            if (!focusRadioDockEl) return;
+            focusRadioDockEl.innerHTML = "";
+            if (!focusedClient || focusAudioOnlyIds.length === 0) return;
+
+            focusAudioOnlyIds.forEach((cid) => {
+                const c = clientMap.get(cid);
+                if (!c || c.isDestroyed) return;
+                const isRadioMuted = !!(c.isChannelMuted || c.channelVolume <= 0 || masterMuted || masterVolume <= 0);
+                const shortName = Array.from((c.channel.name || "").trim()).slice(0, 3).join("") || "?";
+
+                const circle = document.createElement("button");
+                circle.type = "button";
+                circle.className = `focus-radio-circle${isRadioMuted ? " is-muted" : ""}`;
+                circle.style.setProperty("--room-color", getFocusRoomColor(cid));
+                circle.title = `'${c.channel.name}' 🎧 라디오 (${isRadioMuted ? "음소거" : c.channelVolume + "%"})\n좌클릭: 음소거 토글 · 우클릭: 끄기 / 채널 이동 / 볼륨`;
+
+                const nameSpan = document.createElement("span");
+                nameSpan.className = "focus-radio-circle-name";
+                nameSpan.textContent = shortName;
+                circle.appendChild(nameSpan);
+
+                if (isRadioMuted) {
+                    const muteTag = document.createElement("span");
+                    muteTag.className = "focus-radio-circle-mute";
+                    muteTag.textContent = "🔇";
+                    circle.appendChild(muteTag);
+                }
+
+                circle.onclick = (e) => {
+                    e.stopPropagation();
+                    c.toggleVideoMute();
+                };
+                circle.oncontextmenu = (e) => {
+                    openHudContextMenu(e, cid, "circle");
+                };
+                focusRadioDockEl.appendChild(circle);
+            });
+        }
+
+        function saveFocusStreamState(targetClient) {
+            if (!targetClient) return;
+            const cid = targetClient.channel.id;
+            if (!focusStreamSavedStates.has(cid)) {
+                focusStreamSavedStates.set(cid, {
+                    wasVideoOpen: targetClient.isVideoOpen,
+                    prevQuality: targetClient.preferredQuality,
+                    prevMuted: targetClient.isChannelMuted,
+                });
+            }
+        }
+
+        function returnVideoPanelToColumn(targetClient) {
+            if (!targetClient) return;
+            if (targetClient.colBodyEl && targetClient.focusResizerElNav) {
+                targetClient.colBodyEl.insertBefore(targetClient.videoPanelEl, targetClient.focusResizerElNav);
+            } else if (targetClient.colBodyEl) {
+                targetClient.colBodyEl.prepend(targetClient.videoPanelEl);
+            }
+            targetClient.videoPanelEl.classList.remove("drag-over", "badge-yield-top", "focus-right-col");
+            if (targetClient.videoBadgeEl) {
+                targetClient.videoBadgeEl.draggable = false;
+                targetClient.videoBadgeEl.title = "";
+            }
+            if (targetClient.videoBadgeMetaEl) delete targetClient.videoBadgeMetaEl.dataset.order;
+            targetClient.videoFocusBtn.textContent = "⤢";
+            targetClient.videoFocusBtn.title = "시청 모드 (더블클릭)";
+        }
+
+        function addStreamToFocus(targetClient, isInitial = false) {
+            if (!targetClient || targetClient.isDestroyed || !focusVideoGridEl) return;
+            const cid = targetClient.channel.id;
+            saveFocusStreamState(targetClient);
+            focusAudioOnlyIds = focusAudioOnlyIds.filter(id => id !== cid);
+            const wasAudioOnly = !!targetClient.isAudioOnlyStream;
+            targetClient.isAudioOnlyStream = false;
+
+            if (!focusActiveVideoIds.includes(cid)) {
+                focusActiveVideoIds.push(cid);
+            }
+            focusSuspendedClients = focusSuspendedClients.filter(c => c !== targetClient);
+
+            const targetQual = getFocusAutoQuality(focusActiveVideoIds.length);
+            targetClient.videoFocusBtn.textContent = "↩";
+            targetClient.videoFocusBtn.title = "멀티뷰로 복귀 (더블클릭 / Esc)";
+            targetClient.preferredQuality = targetQual;
+            targetClient.videoQualBtn.textContent = targetQual === 0 ? "원본" : `${targetQual}p`;
+
+            const savedMuted = loadSavedFocusPreset()?.mutedById?.[cid];
+            if (typeof savedMuted === "boolean") {
+                targetClient.setVideoMuted(savedMuted, false);
+            } else if (isInitial) {
+                targetClient.setVideoMuted(false, false);
+            } else {
+                targetClient.applyAudioState();
+            }
+
+            if (!targetClient.isVideoOpen) {
+                targetClient.isVideoOpen = true;
+                targetClient.toggleVideoBtn.classList.add("active");
+                targetClient.startVideo();
+            } else if (wasAudioOnly || (!targetClient.hls && !targetClient.videoEl.src)) {
+                targetClient.startVideo();
+            } else {
+                targetClient.applyPreferredVideoLevel(true);
+                targetClient.snapToLiveEdge();
+            }
+
+            layoutFocusVideoPanels();
+            wakeFocusHud();
+        }
+
+        function removeStreamFromFocus(targetClient) {
+            if (!targetClient) return;
+            if (focusActiveVideoIds.length <= 1) {
+                showUndoToast("최소 1개 영상은 유지됩니다. 멀티뷰 복귀는 ↩ 또는 Esc를 누르세요.", null);
+                return;
+            }
+            const cid = targetClient.channel.id;
+            focusActiveVideoIds = focusActiveVideoIds.filter(id => id !== cid);
+            targetClient.isAudioOnlyStream = false;
+
+            const saved = focusStreamSavedStates.get(cid);
+            focusStreamSavedStates.delete(cid);
+
+            returnVideoPanelToColumn(targetClient);
+
+            if (saved) {
+                targetClient.preferredQuality = saved.prevQuality;
+                targetClient.videoQualBtn.textContent = saved.prevQuality === 0 ? "원본" : `${saved.prevQuality}p`;
+                targetClient.setVideoMuted(saved.prevMuted, false);
+                targetClient.isVideoOpen = saved.wasVideoOpen;
+                targetClient.toggleVideoBtn.classList.toggle("active", saved.wasVideoOpen);
+                targetClient.videoPanelEl.classList.toggle("hidden", !saved.wasVideoOpen);
+                if (saved.wasVideoOpen && !focusSuspendedClients.includes(targetClient)) {
+                    focusSuspendedClients.push(targetClient);
+                }
+            }
+            targetClient.stopVideo();
+
+            layoutFocusVideoPanels();
+            wakeFocusHud();
+        }
+
+        function addAudioOnlyToFocus(targetClient, forceUnmute = true) {
+            if (!targetClient || targetClient.isDestroyed || !focusAudioSinkEl) return;
+            const cid = targetClient.channel.id;
+            if (focusActiveVideoIds.includes(cid) && focusActiveVideoIds.length <= 1) {
+                showUndoToast("최소 1개 영상은 유지됩니다. 다른 영상을 먼저 켠 뒤 소리만 전환하세요.", null);
+                return;
+            }
+
+            saveFocusStreamState(targetClient);
+            focusActiveVideoIds = focusActiveVideoIds.filter(id => id !== cid);
+            if (!focusAudioOnlyIds.includes(cid)) {
+                focusAudioOnlyIds.push(cid);
+            }
+            focusSuspendedClients = focusSuspendedClients.filter(c => c !== targetClient);
+
+            const wasVideoStream = !!(targetClient.isVideoOpen && !targetClient.isAudioOnlyStream && (targetClient.hls || targetClient.videoEl.src));
+            targetClient.isAudioOnlyStream = true;
+            targetClient.videoPanelEl.classList.remove("hidden", "drag-over", "badge-yield-top", "focus-right-col");
+            if (targetClient.videoBadgeEl) targetClient.videoBadgeEl.draggable = false;
+            if (targetClient.videoBadgeMetaEl) delete targetClient.videoBadgeMetaEl.dataset.order;
+            focusAudioSinkEl.appendChild(targetClient.videoPanelEl);
+
+            const savedMuted = loadSavedFocusPreset()?.mutedById?.[cid];
+            if (forceUnmute) {
+                targetClient.setVideoMuted(false, false);
+            } else if (typeof savedMuted === "boolean") {
+                targetClient.setVideoMuted(savedMuted, false);
+            } else {
+                targetClient.setVideoMuted(false, false);
+            }
+
+            if (!targetClient.isVideoOpen || !targetClient.hls || wasVideoStream) {
+                targetClient.isVideoOpen = true;
+                targetClient.toggleVideoBtn.classList.add("active");
+                targetClient.startVideo();
+            } else {
+                targetClient.applyPreferredVideoLevel(true);
+                targetClient.videoEl.play().catch(() => {});
+            }
+
+            layoutFocusVideoPanels();
+            wakeFocusHud();
+        }
+
+        function removeAudioOnlyFromFocus(targetClient) {
+            if (!targetClient) return;
+            const cid = targetClient.channel.id;
+            focusAudioOnlyIds = focusAudioOnlyIds.filter(id => id !== cid);
+            targetClient.isAudioOnlyStream = false;
+
+            const saved = focusStreamSavedStates.get(cid);
+            focusStreamSavedStates.delete(cid);
+
+            returnVideoPanelToColumn(targetClient);
+            if (saved) {
+                targetClient.preferredQuality = saved.prevQuality;
+                targetClient.videoQualBtn.textContent = saved.prevQuality === 0 ? "원본" : `${saved.prevQuality}p`;
+                targetClient.setVideoMuted(saved.prevMuted, false);
+                targetClient.isVideoOpen = saved.wasVideoOpen;
+                targetClient.toggleVideoBtn.classList.toggle("active", saved.wasVideoOpen);
+                targetClient.videoPanelEl.classList.toggle("hidden", !saved.wasVideoOpen);
+                if (saved.wasVideoOpen && !focusSuspendedClients.includes(targetClient)) {
+                    focusSuspendedClients.push(targetClient);
+                }
+            }
+            targetClient.stopVideo();
+
+            layoutFocusVideoPanels();
+            wakeFocusHud();
+        }
+
+        function toggleFocusAudioStream(channelId) {
+            if (!focusedClient) return;
+            const target = clientMap.get(channelId);
+            if (!target || target.isDestroyed) return;
+            if (focusAudioOnlyIds.includes(channelId)) {
+                removeAudioOnlyFromFocus(target);
+            } else {
+                addAudioOnlyToFocus(target, true);
+            }
+        }
+
+        function toggleFocusVideoStream(channelId) {
+            if (!focusedClient) return;
+            const target = clientMap.get(channelId);
+            if (!target || target.isDestroyed) return;
+            if (focusActiveVideoIds.includes(channelId)) {
+                removeStreamFromFocus(target);
+            } else if (focusAudioOnlyIds.includes(channelId)) {
+                removeAudioOnlyFromFocus(target);
+            } else {
+                addStreamToFocus(target, false);
+            }
+        }
+
+        function getFocusRoomColor(channelId) {
+            const idx = activeChannels.findIndex(c => c.id === channelId);
+            return FOCUS_ROOM_COLORS[(idx >= 0 ? idx : 0) % FOCUS_ROOM_COLORS.length];
+        }
+
+        function createRoomTagEl(channelId, channelName) {
+            const tag = document.createElement("span");
+            tag.className = "room-tag";
+            tag.style.setProperty("--room-color", getFocusRoomColor(channelId));
+            tag.textContent = channelName || "";
+            tag.title = `${channelName || ""} 방`;
+            return tag;
+        }
+
+        function isCustomFocusChatView() {
+            if (!focusedClient) return false;
+            if (focusChatMerged) return true;
+            return focusChatSelectedIds.length !== 1 || focusChatSelectedIds[0] !== focusedClient.channel.id;
+        }
+
+        function getFocusedChatSourceSet() {
+            if (!focusedClient) return new Set();
+            const valid = focusChatSelectedIds.filter(id => clientMap.has(id));
+            return new Set(valid.length > 0 ? valid : [focusedClient.channel.id]);
+        }
+
+        function updateFocusChatBarOverflow() {
+            if (!focusedClient || !focusedClient.focusChatBarEl || !focusedClient.focusChatBarWrapEl) return;
+            const bar = focusedClient.focusChatBarEl;
+            const wrap = focusedClient.focusChatBarWrapEl;
+            const hasMore = bar.scrollHeight > 34;
+            wrap.classList.toggle("has-overflow", hasMore);
+        }
+
+        function renderFocusChatBar() {
+            if (!focusedClient || !focusedClient.focusChatBarEl) return;
+            const bar = focusedClient.focusChatBarEl;
+            bar.innerHTML = "";
+
+            const pinToggleBtn = document.createElement("button");
+            pinToggleBtn.type = "button";
+            pinToggleBtn.className = `focus-chat-chip pin-btn${focusedClient.isPinHidden ? "" : " active"}`;
+            pinToggleBtn.textContent = "📌";
+            pinToggleBtn.title = "스트리머·매니저 칸 접기/펴기 (H)";
+            pinToggleBtn.onclick = () => {
+                if (!focusedClient) return;
+                focusedClient.setPinHidden(!focusedClient.isPinHidden);
+                pinToggleBtn.classList.toggle("active", !focusedClient.isPinHidden);
+            };
+            bar.appendChild(pinToggleBtn);
+
+            const mergeBtn = document.createElement("button");
+            mergeBtn.type = "button";
+            mergeBtn.className = `focus-chat-chip merge-btn${focusChatMerged ? " active" : ""}`;
+            mergeBtn.textContent = focusChatMerged ? "✔ 합치기" : "합치기";
+            mergeBtn.title = focusChatMerged
+                ? "통합 채팅 끄고 현재 방송 채팅만 보기"
+                : "열려 있는 방 채팅을 시간순으로 합쳐 보기";
+            mergeBtn.onclick = () => {
+                if (!focusedClient) return;
+                if (focusChatMerged) {
+                    focusChatMerged = false;
+                    focusChatSelectedIds = [focusedClient.channel.id];
+                } else {
+                    focusChatMerged = true;
+                    focusChatSelectedIds = activeChannels.map(c => c.id);
+                }
+                rebuildFocusChatView();
+            };
+            bar.appendChild(mergeBtn);
+
+            const selectedSet = getFocusedChatSourceSet();
+            activeChannels.forEach((ch) => {
+                const isSelected = selectedSet.has(ch.id);
+                const chip = document.createElement("button");
+                chip.type = "button";
+                chip.className = `focus-chat-chip${isSelected ? " active" : ""}`;
+                chip.title = focusChatMerged
+                    ? `'${ch.name}' 방을 합치기에 포함/제외`
+                    : `'${ch.name}' 방 채팅만 보기`;
+
+                const dot = document.createElement("span");
+                dot.className = "focus-room-dot";
+                dot.style.backgroundColor = getFocusRoomColor(ch.id);
+
+                const label = document.createElement("span");
+                label.textContent = ch.name;
+
+                chip.appendChild(dot);
+                chip.appendChild(label);
+                chip.onclick = () => {
+                    if (!focusedClient) return;
+                    if (focusChatMerged) {
+                        const exists = focusChatSelectedIds.includes(ch.id);
+                        if (exists) {
+                            if (focusChatSelectedIds.length <= 1) return;
+                            focusChatSelectedIds = focusChatSelectedIds.filter(id => id !== ch.id);
+                        } else {
+                            focusChatSelectedIds = [...focusChatSelectedIds, ch.id];
+                        }
+                    } else {
+                        focusChatSelectedIds = [ch.id];
+                    }
+                    rebuildFocusChatView();
+                };
+                bar.appendChild(chip);
+            });
+
+            requestAnimationFrame(updateFocusChatBarOverflow);
+        }
+
+        function rebuildFocusChatView() {
+            if (!focusedClient) return;
+            renderFocusChatBar();
+
+            const custom = isCustomFocusChatView();
+            focusedClient.chatPaneEl.classList.toggle("focus-custom-active", custom);
+            focusPendingMainQueue.length = 0;
+            focusPendingPinQueue.length = 0;
+            _needScrollFocusMain = false;
+            _needScrollFocusPin = false;
+
+            if (!custom) {
+                focusedClient.runWithAnchorPreserved(() => {});
+                saveCurrentFocusPreset();
+                return;
+            }
+
+            const sources = getFocusedChatSourceSet();
+            if (focusedClient.focusPinTitleEl) {
+                if (focusChatMerged) {
+                    focusedClient.focusPinTitleEl.textContent = "📌 통합 스트리머 · 매니저";
+                } else {
+                    const onlyId = Array.from(sources)[0];
+                    const targetClient = clientMap.get(onlyId);
+                    const roomName = targetClient ? targetClient.channel.name : "";
+                    focusedClient.focusPinTitleEl.textContent = `📌 스트리머 · 매니저 (${roomName})`;
+                }
+            }
+
+            // 최근 메인 채팅 시간순 백필
+            const chatPool = [];
+            sources.forEach((cid) => {
+                const srcClient = clientMap.get(cid);
+                if (srcClient && srcClient.recentChats.length > 0) {
+                    for (let i = 0; i < srcClient.recentChats.length; i++) {
+                        chatPool.push(srcClient.recentChats[i]);
+                    }
+                }
+            });
+            chatPool.sort((a, b) => a.ts - b.ts);
+            const slicedChats = chatPool.slice(-MAX_MAIN_NODES_AUTO);
+
+            const mainFrag = document.createDocumentFragment();
+            for (let i = 0; i < slicedChats.length; i++) {
+                const entry = slicedChats[i];
+                const roomInfo = focusChatMerged ? { id: entry.channelId, name: entry.channelName } : null;
+                mainFrag.appendChild(
+                    focusedClient.buildChatNode(entry.item, entry.isDonation, entry.parsedProfile, entry.parsedExtras, roomInfo)
+                );
+            }
+            focusedClient.focusMsgsEl.innerHTML = "";
+            focusedClient.focusMsgsEl.appendChild(mainFrag);
+            focusedClient.autoScrollFocusMain = true;
+            focusedClient.focusScrollBtnEl.classList.remove("visible");
+
+            // 최근 스트리머·매니저 채팅 백필
+            const pinPool = [];
+            sources.forEach((cid) => {
+                const srcClient = clientMap.get(cid);
+                if (srcClient && srcClient.recentPins.length > 0) {
+                    for (let i = 0; i < srcClient.recentPins.length; i++) {
+                        pinPool.push(srcClient.recentPins[i]);
+                    }
+                }
+            });
+            pinPool.sort((a, b) => a.ts - b.ts);
+            const slicedPins = pinPool.slice(-MAX_PIN_NODES);
+
+            focusedClient.focusPinListEl.innerHTML = "";
+            if (slicedPins.length === 0) {
+                focusedClient.focusPinListEl.innerHTML = `<div class="pinned-empty">스트리머·매니저 채팅이 여기에 표시됩니다.</div>`;
+            } else {
+                const pinFrag = document.createDocumentFragment();
+                for (let i = 0; i < slicedPins.length; i++) {
+                    const p = slicedPins[i];
+                    const roomInfo = focusChatMerged ? { id: p.channelId, name: p.channelName } : null;
+                    pinFrag.appendChild(focusedClient.buildPinnedNode(p, roomInfo));
+                }
+                focusedClient.focusPinListEl.appendChild(pinFrag);
+            }
+            focusedClient.autoScrollFocusPin = true;
+
+            requestAnimationFrame(() => {
+                if (focusedClient && !focusedClient.isDestroyed) {
+                    focusedClient.keepBottomAnchor();
+                }
+            });
+            saveCurrentFocusPreset();
+        }
 
         function enterFocusMode(client) {
             if (!client || client.isDestroyed) return;
             if (focusedClient === client) return;
             if (focusedClient) exitFocusMode(true);
 
+            focusRestoring = true;
             focusedClient = client;
             focusPrevFullscreen = !!document.fullscreenElement;
-            focusPrevQuality = client.preferredQuality;
-            focusPrevMuted = client.isChannelMuted;
             focusSuspendedClients = [];
+            lastFocusAutoTier = null;
+            focusStreamSavedStates.clear();
+            focusPendingMainQueue.length = 0;
+            focusPendingPinQueue.length = 0;
+
+            const preset = loadSavedFocusPreset();
+            const validSavedVideos = (preset?.videoIds || []).filter(id => {
+                const c = clientMap.get(id);
+                return c && !c.isDestroyed;
+            });
+            const canRestorePreset = validSavedVideos.includes(client.channel.id) && validSavedVideos.length >= 1;
+            const targetVideoIds = canRestorePreset ? validSavedVideos : [client.channel.id];
+            const targetVideoSet = new Set(targetVideoIds);
+            const targetAudioIds = canRestorePreset
+                ? (preset?.audioOnlyIds || []).filter(id => {
+                    const c = clientMap.get(id);
+                    return c && !c.isDestroyed && !targetVideoSet.has(id);
+                })
+                : [];
+            const targetAudioSet = new Set(targetAudioIds);
+            focusActiveVideoIds = targetVideoIds.slice();
+            focusAudioOnlyIds = targetAudioIds.slice();
+
+            if (canRestorePreset) {
+                const validChatIds = (preset.chatSelectedIds || []).filter(id => {
+                    const c = clientMap.get(id);
+                    return c && !c.isDestroyed;
+                });
+                focusChatMerged = !!preset.chatMerged && validChatIds.length > 0;
+                focusChatSelectedIds = validChatIds.length > 0 ? validChatIds : [client.channel.id];
+            } else {
+                focusChatMerged = false;
+                focusChatSelectedIds = [client.channel.id];
+            }
 
             clientMap.forEach((other) => {
-                if (other !== client && other.isVideoOpen) {
+                if (!targetVideoSet.has(other.channel.id) && !targetAudioSet.has(other.channel.id) && other.isVideoOpen) {
                     focusSuspendedClients.push(other);
                     other.stopVideo();
                 }
             });
 
-            if (!client.isVideoOpen) {
-                client.setVideoOpen(true);
-            }
-
             document.body.classList.add("focus-mode");
             client.container.classList.add("is-focused");
-            client.videoFocusBtn.textContent = "↩";
-            client.videoFocusBtn.title = "멀티뷰로 복귀 (더블클릭 / Esc)";
 
-            client.setVideoMuted(false);
-            client.preferredQuality = 0;
-            client.videoQualBtn.textContent = "원본";
-            client.applyPreferredVideoLevel();
-            client.snapToLiveEdge();
-            client.runWithAnchorPreserved(() => {});
+            targetVideoIds.forEach((cid) => {
+                const targetClient = clientMap.get(cid);
+                if (targetClient && !targetClient.isDestroyed) {
+                    addStreamToFocus(targetClient, cid === client.channel.id);
+                }
+            });
+            targetAudioIds.forEach((cid) => {
+                const targetClient = clientMap.get(cid);
+                if (targetClient && !targetClient.isDestroyed) {
+                    addAudioOnlyToFocus(targetClient, false);
+                }
+            });
+            rebuildFocusChatView();
 
-            if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
-                document.documentElement.requestFullscreen().catch(() => {});
-            }
+            focusRestoring = false;
+            saveCurrentFocusPreset();
+            syncModeDockUI();
+            wakeFocusHud();
+            wakeTopHud(1800);
         }
 
         function exitFocusMode(skipFullscreenExit = false) {
             if (!focusedClient || focusExiting) return;
+            saveCurrentFocusPreset();
             focusExiting = true;
+            closeFocusOverlayPopover();
+            closeHudContextMenu();
 
             const target = focusedClient;
             focusedClient = null;
+            if (focusHudTimer) {
+                clearTimeout(focusHudTimer);
+                focusHudTimer = null;
+            }
+            if (focusTopHudTimer) {
+                clearTimeout(focusTopHudTimer);
+                focusTopHudTimer = null;
+            }
+            if (focusVideoStageEl) {
+                focusVideoStageEl.classList.remove("hud-active", "top-hud-active");
+            }
+            focusChatMerged = false;
+            focusChatSelectedIds = [];
+            focusPendingMainQueue.length = 0;
+            focusPendingPinQueue.length = 0;
+            _needScrollFocusMain = false;
+            _needScrollFocusPin = false;
 
-            document.body.classList.remove("focus-mode");
+            document.body.classList.remove("focus-mode", "focus-split-active", "focus-chat-overlay", "alt-passthrough");
             target.container.classList.remove("is-focused");
-            target.videoFocusBtn.textContent = "⤢";
-            target.videoFocusBtn.title = "전체화면 집중 모드 (더블클릭)";
+            target.chatPaneEl.classList.remove("focus-custom-active");
+            lastFocusAutoTier = null;
+            dragSourceFocusId = null;
 
-            target.setVideoMuted(focusPrevMuted);
-            target.preferredQuality = focusPrevQuality;
-            target.videoQualBtn.textContent = target.preferredQuality === 0 ? "원본" : `${target.preferredQuality}p`;
-            target.applyPreferredVideoLevel();
+            const activeIdsCopy = focusActiveVideoIds.slice();
+            const audioIdsCopy = focusAudioOnlyIds.slice();
+            focusActiveVideoIds = [];
+            focusAudioOnlyIds = [];
 
-            const toRestore = focusSuspendedClients;
+            const toRestore = focusSuspendedClients.slice();
             focusSuspendedClients = [];
+
+            for (let i = 0; i < activeIdsCopy.length; i++) {
+                const c = clientMap.get(activeIdsCopy[i]);
+                const saved = focusStreamSavedStates.get(activeIdsCopy[i]);
+                if (!c || c.isDestroyed) continue;
+                c.isAudioOnlyStream = false;
+                returnVideoPanelToColumn(c);
+                if (saved) {
+                    c.setVideoMuted(saved.prevMuted, false);
+                    c.preferredQuality = saved.prevQuality;
+                    c.videoQualBtn.textContent = saved.prevQuality === 0 ? "원본" : `${saved.prevQuality}p`;
+                    c.applyPreferredVideoLevel(true);
+                    if (!c.isLivePinned) {
+                        c.returnToLiveEdge();
+                    }
+                    if (!saved.wasVideoOpen) {
+                        c.isVideoOpen = false;
+                        c.toggleVideoBtn.classList.remove("active");
+                        c.videoPanelEl.classList.add("hidden");
+                        c.stopVideo();
+                    } else {
+                        c.videoEl.play().catch(() => {});
+                        requestAnimationFrame(() => {
+                            if (!c.isDestroyed && c.isVideoOpen) {
+                                c.videoEl.play().catch(() => {});
+                            }
+                        });
+                    }
+                }
+            }
+
+            for (let i = 0; i < audioIdsCopy.length; i++) {
+                const c = clientMap.get(audioIdsCopy[i]);
+                const saved = focusStreamSavedStates.get(audioIdsCopy[i]);
+                if (!c || c.isDestroyed) continue;
+                const wasUsingAudioSource = !!c.isAudioOnlyStream;
+                c.isAudioOnlyStream = false;
+                returnVideoPanelToColumn(c);
+                if (saved) {
+                    c.setVideoMuted(saved.prevMuted, false);
+                    c.preferredQuality = saved.prevQuality;
+                    c.videoQualBtn.textContent = saved.prevQuality === 0 ? "원본" : `${saved.prevQuality}p`;
+                    if (!saved.wasVideoOpen) {
+                        c.isVideoOpen = false;
+                        c.toggleVideoBtn.classList.remove("active");
+                        c.videoPanelEl.classList.add("hidden");
+                        c.stopVideo();
+                    } else {
+                        c.isVideoOpen = true;
+                        c.toggleVideoBtn.classList.add("active");
+                        c.videoPanelEl.classList.remove("hidden");
+                        if (wasUsingAudioSource) {
+                            c.stopVideo();
+                            if (!toRestore.includes(c)) toRestore.push(c);
+                        } else {
+                            c.applyPreferredVideoLevel(true);
+                            c.videoEl.play().catch(() => {});
+                        }
+                    }
+                } else {
+                    c.isVideoOpen = false;
+                    c.toggleVideoBtn.classList.remove("active");
+                    c.videoPanelEl.classList.add("hidden");
+                    c.stopVideo();
+                }
+            }
+
+            focusStreamSavedStates.clear();
+            updateFocusVideoGridLayout();
+            if (focusVideoHudEl) focusVideoHudEl.innerHTML = "";
+            if (focusRadioDockEl) {
+                focusRadioDockEl.innerHTML = "";
+                focusRadioDockEl.style.top = "";
+            }
+
             for (let i = 0; i < toRestore.length; i++) {
                 const other = toRestore[i];
                 if (!other.isDestroyed && other.isVideoOpen) {
-                    other.startVideo();
+                    if (i === 0) {
+                        other.startVideo();
+                    } else {
+                        setTimeout(() => {
+                            if (!other.isDestroyed && other.isVideoOpen && !focusedClient) {
+                                other.startVideo();
+                            }
+                        }, i * 180);
+                    }
                 }
             }
 
@@ -1652,6 +3952,169 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
             endFocusResize();
             focusExiting = false;
+            syncModeDockUI();
+        }
+
+        const modeDockWrapEl = document.getElementById("mode-dock-wrap");
+        const modeChatBtnEl = document.getElementById("btn-mode-chat");
+        const modeWatchBtnEl = document.getElementById("btn-mode-watch");
+        const modeExpandBtnEl = document.getElementById("btn-mode-expand");
+        const modeCollapseBtnEl = document.getElementById("btn-mode-collapse");
+        const modeHintEl = document.getElementById("mode-dock-hint");
+        const modeHintCloseBtnEl = document.getElementById("btn-mode-hint-close");
+
+        let modeDockIntroTimer = null;
+        let modeDockPendingCollapse = false;
+        let modeDockIntroShown = false;
+        let modeExpandNearHover = false;
+
+        function setModeExpandNearHover(next) {
+            if (!modeExpandBtnEl || modeExpandNearHover === next) return;
+            modeExpandNearHover = next;
+            modeExpandBtnEl.classList.toggle("near-hover", next);
+        }
+
+        function finishModeDockIntro(shouldCollapse = true) {
+            if (!modeDockWrapEl) return;
+            if (modeDockIntroTimer) {
+                clearTimeout(modeDockIntroTimer);
+                modeDockIntroTimer = null;
+            }
+            modeDockPendingCollapse = false;
+            modeDockWrapEl.classList.remove("intro-spotlight");
+            if (shouldCollapse) {
+                modeDockWrapEl.classList.add("is-collapsed");
+            }
+        }
+
+        function triggerModeDockIntro() {
+            if (!modeDockWrapEl || modeDockWrapEl.classList.contains("is-hidden")) return;
+            modeDockIntroShown = true;
+            setModeExpandNearHover(false);
+            modeDockWrapEl.classList.remove("is-collapsed");
+            modeDockWrapEl.classList.add("intro-spotlight");
+            modeDockPendingCollapse = false;
+            if (modeDockIntroTimer) clearTimeout(modeDockIntroTimer);
+            modeDockIntroTimer = setTimeout(() => {
+                modeDockIntroTimer = null;
+                if (modeDockWrapEl.matches(":hover")) {
+                    modeDockPendingCollapse = true;
+                    return;
+                }
+                finishModeDockIntro(true);
+            }, 5500);
+        }
+
+        function syncModeDockUI() {
+            if (!modeDockWrapEl) return;
+            const hasChannels = activeChannels.length > 0;
+            modeDockWrapEl.classList.toggle("is-hidden", !hasChannels);
+            const inWatch = !!focusedClient;
+            if (modeChatBtnEl) modeChatBtnEl.classList.toggle("active", !inWatch);
+            if (modeWatchBtnEl) modeWatchBtnEl.classList.toggle("active", inWatch);
+            if (hasChannels && !modeDockIntroShown) {
+                triggerModeDockIntro();
+            } else if (!hasChannels) {
+                setModeExpandNearHover(false);
+                finishModeDockIntro(true);
+            }
+        }
+
+        function enterDefaultWatchMode() {
+            if (focusedClient || activeChannels.length === 0) return;
+            const preset = loadSavedFocusPreset();
+            let pickClient = null;
+            if (preset && Array.isArray(preset.videoIds)) {
+                for (let i = 0; i < preset.videoIds.length; i++) {
+                    const c = clientMap.get(preset.videoIds[i]);
+                    if (c && !c.isDestroyed) {
+                        pickClient = c;
+                        break;
+                    }
+                }
+            }
+            if (!pickClient) {
+                for (let i = 0; i < activeChannels.length; i++) {
+                    const c = clientMap.get(activeChannels[i].id);
+                    if (c && !c.isDestroyed && c.isVideoOpen) {
+                        pickClient = c;
+                        break;
+                    }
+                }
+            }
+            if (!pickClient) {
+                pickClient = clientMap.get(activeChannels[0].id);
+            }
+            if (pickClient) {
+                enterFocusMode(pickClient);
+            }
+        }
+
+        if (modeDockWrapEl) {
+            modeDockWrapEl.addEventListener("mouseleave", () => {
+                if (modeDockPendingCollapse) {
+                    finishModeDockIntro(true);
+                }
+            });
+            if (modeExpandBtnEl) {
+                modeExpandBtnEl.addEventListener("click", () => {
+                    modeDockPendingCollapse = false;
+                    setModeExpandNearHover(false);
+                    modeDockWrapEl.classList.remove("is-collapsed");
+                });
+            }
+            if (modeCollapseBtnEl) {
+                modeCollapseBtnEl.addEventListener("click", () => {
+                    setModeExpandNearHover(false);
+                    finishModeDockIntro(true);
+                });
+            }
+            if (modeHintCloseBtnEl) {
+                modeHintCloseBtnEl.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    finishModeDockIntro(true);
+                });
+            }
+            if (modeHintEl) {
+                modeHintEl.addEventListener("click", () => {
+                    finishModeDockIntro(true);
+                });
+            }
+            document.addEventListener("mousemove", (e) => {
+                if (!modeExpandBtnEl || modeDockWrapEl.classList.contains("is-hidden") || !modeDockWrapEl.classList.contains("is-collapsed")) {
+                    setModeExpandNearHover(false);
+                    return;
+                }
+                if (e.clientX > 56) {
+                    setModeExpandNearHover(false);
+                    return;
+                }
+                const rect = modeExpandBtnEl.getBoundingClientRect();
+                const nearX = e.clientX <= rect.left + 56;
+                const nearY = e.clientY >= rect.top - 32 && e.clientY <= rect.bottom + 32;
+                setModeExpandNearHover(nearX && nearY);
+            }, { passive: true });
+            document.addEventListener("mouseleave", () => setModeExpandNearHover(false));
+            window.addEventListener("blur", () => setModeExpandNearHover(false));
+            document.addEventListener("pointerdown", (e) => {
+                if (!modeDockWrapEl.classList.contains("is-collapsed") && !modeDockWrapEl.contains(e.target)) {
+                    setModeExpandNearHover(false);
+                    finishModeDockIntro(true);
+                }
+            });
+        }
+
+        if (modeChatBtnEl) {
+            modeChatBtnEl.onclick = () => {
+                finishModeDockIntro(true);
+                if (focusedClient) exitFocusMode();
+            };
+        }
+        if (modeWatchBtnEl) {
+            modeWatchBtnEl.onclick = () => {
+                finishModeDockIntro(true);
+                if (!focusedClient) enterDefaultWatchMode();
+            };
         }
 
         const FOCUS_CHAT_WIDTH_KEY = "chzzk_focus_chat_width";
@@ -1661,12 +4124,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (px == null) {
                 document.documentElement.style.removeProperty("--focus-chat-width");
                 if (persist) localStorage.removeItem(FOCUS_CHAT_WIDTH_KEY);
+                if (focusedClient) requestAnimationFrame(syncTopHudClearance);
                 return;
             }
             const maxPx = Math.max(260, Math.min(560, Math.floor(window.innerWidth * 0.48)));
             const clamped = Math.max(220, Math.min(maxPx, Math.round(px)));
             document.documentElement.style.setProperty("--focus-chat-width", `${clamped}px`);
             if (persist) localStorage.setItem(FOCUS_CHAT_WIDTH_KEY, String(clamped));
+            if (focusedClient) requestAnimationFrame(syncTopHudClearance);
         }
 
         function endFocusResize() {
@@ -1712,7 +4177,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         })();
 
         function toggleFocusMode(client) {
-            if (focusedClient === client) {
+            if (focusedClient) {
                 exitFocusMode();
             } else {
                 enterFocusMode(client);
@@ -1720,13 +4185,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         document.addEventListener("fullscreenchange", () => {
-            if (focusedClient && !document.fullscreenElement) {
-                exitFocusMode(true);
+            if (focusedClient) {
+                renderFocusVideoHud();
             }
         });
 
         window.addEventListener("keydown", (e) => {
+            if (e.key === "Alt" && focusedClient && focusChatOverlay) {
+                e.preventDefault();
+                document.body.classList.add("alt-passthrough");
+                return;
+            }
             if (e.key === "Escape") {
+                if (hudCtxMenuEl && hudCtxMenuEl.classList.contains("open")) {
+                    closeHudContextMenu();
+                    return;
+                }
                 if (historyCtxMenuEl.classList.contains("open")) {
                     closeHistoryContextMenu();
                     return;
@@ -1749,6 +4223,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 return;
             }
+            if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+                const isUndo = !e.shiftKey && (e.code === "KeyZ" || e.key.toLowerCase() === "z");
+                const isRedo =
+                    (e.shiftKey && (e.code === "KeyZ" || e.key.toLowerCase() === "z")) ||
+                    (!e.shiftKey && (e.code === "KeyY" || e.key.toLowerCase() === "y"));
+                if (isUndo || isRedo) {
+                    const tag = e.target.tagName;
+                    const isTextField =
+                        e.target.isContentEditable ||
+                        tag === "TEXTAREA" ||
+                        (tag === "INPUT" && !["range", "button", "checkbox", "radio"].includes(e.target.type));
+                    if (!isTextField && !focusedClient) {
+                        const handled = isUndo ? undoCloseChannel() : redoCloseChannel();
+                        if (handled) {
+                            e.preventDefault();
+                        }
+                    }
+                    return;
+                }
+            }
             if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
             if (e.key === "-" || e.key === "_") applyFontSize(currentFontSize - 1);
             if (e.key === "+" || e.key === "=") applyFontSize(currentFontSize + 1);
@@ -1758,6 +4252,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const anyVisible = clients.some(c => !c.isPinHidden);
                 clients.forEach(c => c.setPinHidden(anyVisible));
             }
+        });
+
+        window.addEventListener("keyup", (e) => {
+            if (e.key === "Alt") {
+                document.body.classList.remove("alt-passthrough");
+            }
+        });
+        window.addEventListener("blur", () => {
+            document.body.classList.remove("alt-passthrough");
         });
 
         function escapeHtml(str) {
@@ -1831,11 +4334,76 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     scrollTargets.push(c);
                 }
             }
+            const needFocusScroll = flushFocusChatDomOnly();
 
             // Phase 2: 모든 채널의 스크롤 갱신을 한 번에 처리 (Forced Reflow 최소화)
             for (let i = 0; i < scrollTargets.length; i++) {
                 scrollTargets[i].flushScrollOnly();
             }
+            if (needFocusScroll) {
+                flushFocusChatScrollOnly();
+            }
+        }
+
+        function flushFocusChatDomOnly() {
+            if (!focusedClient || focusedClient.isDestroyed || !isCustomFocusChatView()) {
+                focusPendingMainQueue.length = 0;
+                focusPendingPinQueue.length = 0;
+                return false;
+            }
+            if (focusPendingMainQueue.length > 0) {
+                const maxDom = focusedClient.autoScrollFocusMain ? MAX_MAIN_NODES_AUTO : MAX_MAIN_NODES_PAUSED;
+                const startIdx = Math.max(0, focusPendingMainQueue.length - maxDom);
+                const frag = document.createDocumentFragment();
+                for (let i = startIdx; i < focusPendingMainQueue.length; i++) {
+                    const entry = focusPendingMainQueue[i];
+                    const roomInfo = focusChatMerged ? { id: entry.channelId, name: entry.channelName } : null;
+                    frag.appendChild(
+                        focusedClient.buildChatNode(entry.item, entry.isDonation, entry.parsedProfile, entry.parsedExtras, roomInfo)
+                    );
+                }
+                focusPendingMainQueue.length = 0;
+                focusedClient.focusMsgsEl.appendChild(frag);
+                while (focusedClient.focusMsgsEl.children.length > maxDom) {
+                    focusedClient.focusMsgsEl.removeChild(focusedClient.focusMsgsEl.firstChild);
+                }
+                if (focusedClient.autoScrollFocusMain) {
+                    _needScrollFocusMain = true;
+                }
+            }
+            if (focusPendingPinQueue.length > 0) {
+                const emptyPlaceholder = focusedClient.focusPinListEl.querySelector(".pinned-empty");
+                if (emptyPlaceholder) emptyPlaceholder.remove();
+
+                const startIdx = Math.max(0, focusPendingPinQueue.length - MAX_PIN_NODES);
+                const frag = document.createDocumentFragment();
+                for (let i = startIdx; i < focusPendingPinQueue.length; i++) {
+                    const entry = focusPendingPinQueue[i];
+                    const roomInfo = focusChatMerged ? { id: entry.channelId, name: entry.channelName } : null;
+                    frag.appendChild(focusedClient.buildPinnedNode(entry, roomInfo));
+                }
+                focusPendingPinQueue.length = 0;
+                focusedClient.focusPinListEl.appendChild(frag);
+                while (focusedClient.focusPinListEl.children.length > MAX_PIN_NODES) {
+                    focusedClient.focusPinListEl.removeChild(focusedClient.focusPinListEl.firstChild);
+                }
+                if (!focusedClient.isPinHidden && focusedClient.autoScrollFocusPin) {
+                    _needScrollFocusPin = true;
+                }
+            }
+            return _needScrollFocusMain || _needScrollFocusPin;
+        }
+
+        function flushFocusChatScrollOnly() {
+            if (!focusedClient || focusedClient.isDestroyed) return;
+            if (_needScrollFocusMain && focusedClient.autoScrollFocusMain) {
+                focusedClient.focusMsgsEl.scrollTop = focusedClient.focusMsgsEl.scrollHeight;
+            }
+            if (_needScrollFocusPin && focusedClient.autoScrollFocusPin && !focusedClient.isPinHidden) {
+                focusedClient.focusPinListEl.scrollTop = focusedClient.focusPinListEl.scrollHeight;
+            }
+            _needScrollFocusMain = false;
+            _needScrollFocusPin = false;
         }
 
         document.addEventListener("visibilitychange", () => {
@@ -1889,6 +4457,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        function formatClockTime(ms) {
+            const d = new Date(ms);
+            const hh = String(d.getHours()).padStart(2, "0");
+            const mm = String(d.getMinutes()).padStart(2, "0");
+            const ss = String(d.getSeconds()).padStart(2, "0");
+            return `${hh}:${mm}:${ss}`;
+        }
+
         function getTimeString() {
             const now = new Date();
             const hh = String(now.getHours()).padStart(2, "0");
@@ -1900,15 +4476,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         function ensureHlsLib() {
             if (window.Hls) return Promise.resolve(window.Hls);
             if (hlsLibPromise) return hlsLibPromise;
+            const cdnUrls = [
+                "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js",
+                "https://unpkg.com/hls.js@1/dist/hls.min.js"
+            ];
             hlsLibPromise = new Promise((resolve, reject) => {
-                const s = document.createElement("script");
-                s.src = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js";
-                s.onload = () => resolve(window.Hls);
-                s.onerror = () => {
-                    hlsLibPromise = null;
-                    reject(new Error("hls.js 로드 실패"));
+                let idx = 0;
+                const tryNext = () => {
+                    if (window.Hls) {
+                        resolve(window.Hls);
+                        return;
+                    }
+                    if (idx >= cdnUrls.length) {
+                        hlsLibPromise = null;
+                        reject(new Error("hls.js 로드 실패"));
+                        return;
+                    }
+                    const s = document.createElement("script");
+                    s.src = cdnUrls[idx++];
+                    s.onload = () => {
+                        if (window.Hls) {
+                            resolve(window.Hls);
+                        } else {
+                            tryNext();
+                        }
+                    };
+                    s.onerror = () => {
+                        s.remove();
+                        tryNext();
+                    };
+                    document.head.appendChild(s);
                 };
-                document.head.appendChild(s);
+                tryNext();
             });
             return hlsLibPromise;
         }
@@ -1924,8 +4523,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 this.hls = null;
                 this.isVideoOpen = false;
+                this.isAudioOnlyStream = false;
                 this.videoLoadSeq = 0;
+                this.videoRetryTimer = null;
                 this.preferredQuality = 360;
+                this.isTimeMachine = false;
+                this.isLivePinned = true;
+                this.isScrubbingTm = false;
+                this.hasManualSyncHold = false;
+                this.fineSyncRemainingSec = 0;
+                this.manualSyncOffsetSec = 0;
+                this.fineSyncTimer = null;
+                this.fineSyncLastTs = 0;
                 this.channelVolume = loadSavedPct(`chzzk_channel_vol_${channel.id}`, 50);
                 this.lastNonZeroVol = this.channelVolume > 0 ? this.channelVolume : 50;
                 this.isChannelMuted = true;
@@ -1940,12 +4549,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 this.pendingMainQueue = [];
                 this.pendingPinQueue = [];
+                this.recentChats = [];
+                this.recentPins = [];
                 this._needScrollMain = false;
                 this._needScrollPin = false;
 
                 this.autoScrollMain = true;
                 this.autoScrollPin = true;
+                this.autoScrollFocusMain = true;
+                this.autoScrollFocusPin = true;
                 this.ignoreScroll = false;
+                this.suppressDblClickUntil = 0;
 
                 const savedHidden = localStorage.getItem(`chzzk_pin_hidden_${channel.id}`);
                 this.isPinHidden = savedHidden === null ? true : savedHidden === "1";
@@ -1962,25 +4576,47 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         </div>
                     </div>
                     <div class="col-body">
-                        <div class="video-panel hidden" title="더블클릭: 전체화면 집중 모드 (최고 화질)">
+                        <div class="video-panel hidden" title="더블클릭: 전체화면 | 꾹 누르고 좌우 스와이프: 타임머신">
                             <video class="video-player" muted playsinline autoplay></video>
+                            <div class="video-swipe-hud hidden"></div>
                             <div class="video-msg hidden"></div>
-                            <span class="video-info-badge">LIVE</span>
+                            <span class="video-info-badge">
+                                <span class="video-badge-meta">LIVE</span>
+                                <span class="video-badge-title"></span>
+                            </span>
                             <div class="video-overlay">
                                 <div class="video-vol-wrap">
                                     <button type="button" class="btn-video-ctrl btn-video-mute" title="음소거 / 해제">🔇</button>
                                     <input type="range" class="vol-slider video-vol-slider" min="0" max="100" value="50" title="이 방송 개별 볼륨">
                                 </div>
+                                <div class="video-sync-wrap">
+                                    <button type="button" class="btn-video-ctrl btn-sync-step btn-sync-back" title="미세 지연 (-0.5초 배속 · Shift: -0.2초)">-0.5</button>
+                                    <span class="video-sync-badge hidden" title="클릭: 배속 싱크 초기화 (실시간 복귀)"></span>
+                                    <button type="button" class="btn-video-ctrl btn-sync-step btn-sync-fwd" title="미세 당김 (+0.5초 배속 · Shift: +0.2초)">+0.5</button>
+                                </div>
+                                <div class="video-tm-bar">
+                                    <button type="button" class="btn-video-ctrl btn-tm-back" title="10초 뒤로">-10s</button>
+                                    <div class="video-tm-slider-wrap">
+                                        <span class="video-tm-tooltip hidden"></span>
+                                        <input type="range" class="vol-slider video-tm-slider" min="0" max="1000" value="1000" title="타임머신 위치 탐색">
+                                    </div>
+                                    <button type="button" class="btn-video-ctrl btn-tm-fwd" title="10초 앞으로">+10s</button>
+                                    <span class="video-tm-time" title="실시간 대비 시간 차이">실시간</span>
+                                    <button type="button" class="btn-video-ctrl btn-tm-live is-live" title="실시간 시점으로 복귀">● LIVE</button>
+                                </div>
                                 <div class="video-overlay-actions">
                                     <button type="button" class="btn-video-ctrl btn-video-qual" title="화질 전환 (360p / 480p / 720p / 원본)">360p</button>
                                     <button type="button" class="btn-video-ctrl btn-video-focus" title="전체화면 집중 모드 (더블클릭)">⤢</button>
                                     <button type="button" class="btn-video-ctrl btn-video-reload" title="영상 새로고침">↻</button>
-                                    <button type="button" class="btn-video-ctrl btn-video-close" title="영상 닫기">×</button>
                                 </div>
                             </div>
                         </div>
                         <div class="focus-resizer" title="드래그: 채팅창 너비 조절 | 더블클릭: 기본 너비 초기화"></div>
                         <div class="chat-pane">
+                            <div class="focus-chat-bar-wrap" aria-label="전체화면 채팅 선택 및 합치기">
+                                <div class="focus-chat-bar"></div>
+                                <span class="focus-chat-more" title="마우스를 올려 더 많은 방 보기">▾</span>
+                            </div>
                             <div class="pinned-panel">
                                 <div class="pinned-header">
                                     <span>📌 스트리머 · 매니저</span>
@@ -1998,6 +4634,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <div class="messages"></div>
                                 <button class="btn-scroll-bottom">↓ 최신 채팅</button>
                             </div>
+                            <div class="pinned-panel focus-pinned-panel">
+                                <div class="pinned-header">
+                                    <span class="focus-pin-title">📌 스트리머 · 매니저</span>
+                                    <div class="pinned-actions">
+                                        <button class="btn-pin-sub btn-focus-clear-pin">비우기</button>
+                                        <button class="btn-pin-sub btn-focus-hide-pin">접기</button>
+                                    </div>
+                                </div>
+                                <div class="pinned-list focus-pinned-list">
+                                    <div class="pinned-empty">스트리머·매니저 채팅이 여기에 표시됩니다.</div>
+                                </div>
+                            </div>
+                            <div class="resizer focus-inner-resizer" title="드래그: 칸 높이 조절 | 더블클릭: 1/5 초기화"></div>
+                            <div class="messages-wrap focus-messages-wrap">
+                                <div class="messages focus-messages"></div>
+                                <button class="btn-scroll-bottom btn-focus-scroll-bottom">↓ 최신 채팅</button>
+                            </div>
                         </div>
                     </div>
                 `;
@@ -2007,27 +4660,57 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.controlsEl = container.querySelector(".header-controls");
                 this.dotEl = container.querySelector(".status-dot");
                 this.chatPaneEl = container.querySelector(".chat-pane");
-                this.msgsEl = container.querySelector(".messages");
-                this.scrollBtnEl = container.querySelector(".btn-scroll-bottom");
+                this.colBodyEl = container.querySelector(".col-body");
+                this.focusResizerElNav = container.querySelector(".focus-resizer");
+                this.focusChatBarWrapEl = container.querySelector(".focus-chat-bar-wrap");
+                this.focusChatBarEl = container.querySelector(".focus-chat-bar");
+                this.msgsEl = container.querySelector(".messages:not(.focus-messages)");
+                this.scrollBtnEl = container.querySelector(".btn-scroll-bottom:not(.btn-focus-scroll-bottom)");
+                this.focusMsgsEl = container.querySelector(".focus-messages");
+                this.focusScrollBtnEl = container.querySelector(".btn-focus-scroll-bottom");
                 this.videoPanelEl = container.querySelector(".video-panel");
                 this.videoEl = container.querySelector(".video-player");
+                this.videoSwipeHudEl = container.querySelector(".video-swipe-hud");
                 this.videoMsgEl = container.querySelector(".video-msg");
+                if (this.videoMsgEl) {
+                    this.videoMsgEl.onclick = () => {
+                        if (this.videoMsgEl.classList.contains("is-retryable")) {
+                            this.startVideo();
+                        }
+                    };
+                }
                 this.videoBadgeEl = container.querySelector(".video-info-badge");
+                this.videoBadgeMetaEl = container.querySelector(".video-badge-meta");
+                this.videoBadgeTitleEl = container.querySelector(".video-badge-title");
                 this.toggleVideoBtn = container.querySelector(".btn-video-toggle");
                 this.videoMuteBtn = container.querySelector(".btn-video-mute");
                 this.videoVolSlider = container.querySelector(".video-vol-slider");
+                this.syncBackBtn = container.querySelector(".btn-sync-back");
+                this.syncFwdBtn = container.querySelector(".btn-sync-fwd");
+                this.syncBadgeEl = container.querySelector(".video-sync-badge");
                 this.videoQualBtn = container.querySelector(".btn-video-qual");
                 this.videoFocusBtn = container.querySelector(".btn-video-focus");
                 this.videoReloadBtn = container.querySelector(".btn-video-reload");
-                this.videoCloseBtn = container.querySelector(".btn-video-close");
-                this.pinPanelEl = container.querySelector(".pinned-panel");
-                this.pinListEl = container.querySelector(".pinned-list");
-                this.resizerEl = container.querySelector(".resizer");
+                this.tmBackBtn = container.querySelector(".btn-tm-back");
+                this.tmFwdBtn = container.querySelector(".btn-tm-fwd");
+                this.tmSlider = container.querySelector(".video-tm-slider");
+                this.tmTooltipEl = container.querySelector(".video-tm-tooltip");
+                this.tmTimeEl = container.querySelector(".video-tm-time");
+                this.tmLiveBtn = container.querySelector(".btn-tm-live");
+                this.pinPanelEl = container.querySelector(".pinned-panel:not(.focus-pinned-panel)");
+                this.pinListEl = container.querySelector(".pinned-list:not(.focus-pinned-list)");
+                this.resizerEl = container.querySelector(".resizer:not(.focus-inner-resizer)");
+                this.focusPinPanelEl = container.querySelector(".focus-pinned-panel");
+                this.focusPinTitleEl = container.querySelector(".focus-pin-title");
+                this.focusPinListEl = container.querySelector(".focus-pinned-list");
+                this.focusResizerEl = container.querySelector(".focus-inner-resizer");
                 this.togglePinBtn = container.querySelector(".btn-pin-toggle");
                 this.reconnectBtn = container.querySelector(".btn-reconnect");
                 this.closeColBtn = container.querySelector(".btn-close-col");
                 this.clearPinBtn = container.querySelector(".btn-clear-pin");
                 this.hidePinBtn = container.querySelector(".btn-hide-pin");
+                this.focusClearPinBtn = container.querySelector(".btn-focus-clear-pin");
+                this.focusHidePinBtn = container.querySelector(".btn-focus-hide-pin");
 
                 this.nameEl.onclick = () => {
                     window.open(`https://chzzk.naver.com/live/${this.channel.id}`, "_blank", "noopener");
@@ -2044,21 +4727,78 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 };
                 this.videoPanelEl.ondblclick = (e) => {
                     if (e.target.closest(".video-overlay")) return;
+                    if (Date.now() < this.suppressDblClickUntil) return;
                     toggleFocusMode(this);
                 };
+                this.setupSwipeTimeMachine();
+                this.setupBadgeDragSwap();
                 this.videoMuteBtn.onclick = () => this.toggleVideoMute();
                 this.videoVolSlider.oninput = (e) => {
                     this.setChannelVolume(Number(e.target.value));
                 };
                 this.applyAudioState();
+                this.syncBackBtn.onclick = (e) => this.adjustFineSync(e.shiftKey ? -0.2 : -0.5);
+                this.syncFwdBtn.onclick = (e) => this.adjustFineSync(e.shiftKey ? 0.2 : 0.5);
+                this.syncBadgeEl.onclick = () => this.returnToLiveEdge();
                 this.videoQualBtn.onclick = () => this.cycleVideoQuality();
                 this.videoFocusBtn.onclick = () => toggleFocusMode(this);
                 this.videoReloadBtn.onclick = () => this.startVideo();
-                this.videoCloseBtn.onclick = () => this.setVideoOpen(false);
+
+                this.tmBackBtn.onclick = () => this.seekRelative(-10);
+                this.tmFwdBtn.onclick = () => this.seekRelative(10);
+                this.tmLiveBtn.onclick = () => this.returnToLiveEdge();
+                const updateHoverTmTooltip = (ratio, pctLeft) => {
+                    if (!this.tmTooltipEl) return;
+                    const range = this.getSeekRange();
+                    if (!range || range.safeSpan <= 0.5) {
+                        this.tmTooltipEl.classList.add("hidden");
+                        return;
+                    }
+                    const targetTime = range.safeStart + range.safeSpan * ratio;
+                    const behind = Math.max(0, range.end - targetTime);
+                    const clockStr = formatClockTime(Date.now() - behind * 1000);
+                    this.tmTooltipEl.textContent = behind <= 4
+                        ? `${clockStr} (실시간)`
+                        : `${clockStr} (${this.formatOffsetLabel(behind)})`;
+                    this.tmTooltipEl.style.left = `${Math.max(8, Math.min(92, pctLeft)).toFixed(1)}%`;
+                    this.tmTooltipEl.classList.remove("hidden");
+                };
+                this.tmSlider.addEventListener("mousemove", (e) => {
+                    const rect = this.tmSlider.getBoundingClientRect();
+                    if (rect.width <= 0) return;
+                    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                    updateHoverTmTooltip(ratio, ratio * 100);
+                });
+                this.tmSlider.addEventListener("mouseleave", () => {
+                    if (this.tmTooltipEl && !this.isScrubbingTm) {
+                        this.tmTooltipEl.classList.add("hidden");
+                    }
+                });
+                this.tmSlider.oninput = (e) => {
+                    this.isScrubbingTm = true;
+                    const range = this.getSeekRange();
+                    if (!range || range.safeSpan <= 0.5) return;
+                    const ratio = Math.max(0, Math.min(1, Number(e.target.value) / 1000));
+                    const targetTime = range.safeStart + range.safeSpan * ratio;
+                    const behind = Math.max(0, range.end - targetTime);
+                    this.tmTimeEl.textContent = behind <= 4 ? "실시간" : this.formatOffsetLabel(behind);
+                    updateHoverTmTooltip(ratio, ratio * 100);
+                };
+                this.tmSlider.onchange = (e) => {
+                    const range = this.getSeekRange();
+                    this.isScrubbingTm = false;
+                    if (this.tmTooltipEl) this.tmTooltipEl.classList.add("hidden");
+                    if (!range || range.safeSpan <= 0.5) return;
+                    const ratio = Math.max(0, Math.min(1, Number(e.target.value) / 1000));
+                    this.seekToTime(range.safeStart + range.safeSpan * ratio);
+                };
+                this.videoEl.addEventListener("timeupdate", () => this.updateTimeMachineUI());
+                this.videoEl.addEventListener("seeked", () => this.updateTimeMachineUI());
 
                 const savedRatio = localStorage.getItem(`chzzk_pin_ratio_${channel.id}`);
                 if (savedRatio) {
                     this.pinPanelEl.style.height = savedRatio;
+                    if (this.focusPinPanelEl) this.focusPinPanelEl.style.height = savedRatio;
                 }
                 this.setPinHidden(this.isPinHidden);
 
@@ -2083,6 +4823,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 });
 
                 this.hidePinBtn.onclick = () => this.setPinHidden(true);
+                this.focusHidePinBtn.onclick = () => this.setPinHidden(true);
 
                 this.msgsEl.addEventListener("scroll", () => {
                     if (this.ignoreScroll) return;
@@ -2100,6 +4841,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     this.autoScrollPin = dist < 25;
                 }, { passive: true });
 
+                this.focusMsgsEl.addEventListener("scroll", () => {
+                    if (this.ignoreScroll) return;
+                    const dist = this.focusMsgsEl.scrollHeight - this.focusMsgsEl.scrollTop - this.focusMsgsEl.clientHeight;
+                    this.autoScrollFocusMain = dist < 35;
+                    this.focusScrollBtnEl.classList.toggle("visible", !this.autoScrollFocusMain);
+                }, { passive: true });
+
+                this.focusPinListEl.addEventListener("scroll", () => {
+                    const dist = this.focusPinListEl.scrollHeight - this.focusPinListEl.scrollTop - this.focusPinListEl.clientHeight;
+                    this.autoScrollFocusPin = dist < 25;
+                }, { passive: true });
+
                 this.scrollBtnEl.onclick = () => {
                     this.autoScrollMain = true;
                     while (this.msgsEl.children.length > MAX_MAIN_NODES_AUTO) {
@@ -2109,9 +4862,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     this.scrollBtnEl.classList.remove("visible");
                 };
 
-                this.ro = new ResizeObserver(() => this.keepBottomAnchor());
+                this.focusScrollBtnEl.onclick = () => {
+                    this.autoScrollFocusMain = true;
+                    while (this.focusMsgsEl.children.length > MAX_MAIN_NODES_AUTO) {
+                        this.focusMsgsEl.removeChild(this.focusMsgsEl.firstChild);
+                    }
+                    this.focusMsgsEl.scrollTop = this.focusMsgsEl.scrollHeight;
+                    this.focusScrollBtnEl.classList.remove("visible");
+                };
+
+                this.ro = new ResizeObserver(() => {
+                    this.keepBottomAnchor();
+                    if (focusedClient === this) updateFocusChatBarOverflow();
+                });
                 this.ro.observe(this.msgsEl);
                 this.ro.observe(this.pinListEl);
+                this.ro.observe(this.focusMsgsEl);
+                this.ro.observe(this.focusPinListEl);
 
                 this.initResizer();
 
@@ -2121,6 +4888,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     this.connect(false);
                 };
                 this.clearPinBtn.onclick = () => this.clearPinned();
+                this.focusClearPinBtn.onclick = () => {
+                    focusPendingPinQueue.length = 0;
+                    this.focusPinListEl.innerHTML = `<div class="pinned-empty">스트리머·매니저 채팅이 여기에 표시됩니다.</div>`;
+                };
 
                 this.startLivePoller();
                 this.connect(false);
@@ -2192,6 +4963,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             clearPinned() {
                 this.pendingPinQueue.length = 0;
+                this.recentPins.length = 0;
                 this.pinListEl.innerHTML = `<div class="pinned-empty">스트리머·매니저 채팅이 여기에 표시됩니다.</div>`;
                 this.togglePinBtn.classList.remove("has-new");
             }
@@ -2199,10 +4971,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             runWithAnchorPreserved(fn) {
                 const keepMain = this.autoScrollMain;
                 const keepPin = this.autoScrollPin;
+                const keepFocusMain = this.autoScrollFocusMain;
+                const keepFocusPin = this.autoScrollFocusPin;
                 this.ignoreScroll = true;
                 fn();
                 if (keepMain) this.autoScrollMain = true;
                 if (keepPin) this.autoScrollPin = true;
+                if (keepFocusMain) this.autoScrollFocusMain = true;
+                if (keepFocusPin) this.autoScrollFocusPin = true;
                 this.keepBottomAnchor();
                 requestAnimationFrame(() => {
                     if (this.isDestroyed) return;
@@ -2211,6 +4987,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         this.scrollBtnEl.classList.remove("visible");
                     }
                     if (keepPin) this.autoScrollPin = true;
+                    if (keepFocusMain) {
+                        this.autoScrollFocusMain = true;
+                        if (this.focusScrollBtnEl) this.focusScrollBtnEl.classList.remove("visible");
+                    }
+                    if (keepFocusPin) this.autoScrollFocusPin = true;
                     this.keepBottomAnchor();
                     this.ignoreScroll = false;
                 });
@@ -2221,14 +5002,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 localStorage.setItem(`chzzk_pin_hidden_${this.channel.id}`, hidden ? "1" : "0");
 
                 this.runWithAnchorPreserved(() => {
+                    const panels = [this.pinPanelEl, this.focusPinPanelEl];
+                    const resizers = [this.resizerEl, this.focusResizerEl];
+                    for (let i = 0; i < panels.length; i++) {
+                        if (panels[i]) panels[i].classList.toggle("hidden", hidden);
+                    }
+                    for (let i = 0; i < resizers.length; i++) {
+                        if (resizers[i]) resizers[i].classList.toggle("hidden", hidden);
+                    }
+                    const focusPinChip = this.focusChatBarEl?.querySelector(".focus-chat-chip.pin-btn");
+                    if (focusPinChip) focusPinChip.classList.toggle("active", !hidden);
                     if (hidden) {
-                        this.pinPanelEl.classList.add("hidden");
-                        this.resizerEl.classList.add("hidden");
                         this.togglePinBtn.classList.remove("active");
                         this.togglePinBtn.classList.add("muted");
                     } else {
-                        this.pinPanelEl.classList.remove("hidden");
-                        this.resizerEl.classList.remove("hidden");
                         this.togglePinBtn.classList.add("active");
                         this.togglePinBtn.classList.remove("muted", "has-new");
                     }
@@ -2240,6 +5027,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const val = clamped.toFixed(2) + "%";
                 this.runWithAnchorPreserved(() => {
                     this.pinPanelEl.style.height = val;
+                    if (this.focusPinPanelEl) this.focusPinPanelEl.style.height = val;
                     localStorage.setItem(`chzzk_pin_ratio_${this.channel.id}`, val);
                 });
             }
@@ -2250,10 +5038,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.onMouseMove = (e) => {
                     if (!isDragging) return;
                     const paneRect = this.chatPaneEl.getBoundingClientRect();
-                    const availableH = paneRect.height;
+                    const topOffset = (focusedClient === this && this.focusChatBarWrapEl && this.focusChatBarWrapEl.offsetHeight)
+                        ? this.focusChatBarWrapEl.offsetHeight
+                        : 0;
+                    const availableH = paneRect.height - topOffset;
                     if (availableH <= 0) return;
 
-                    const newPinH = e.clientY - paneRect.top;
+                    const newPinH = e.clientY - (paneRect.top + topOffset);
                     const percent = (newPinH / availableH) * 100;
 
                     if (e.shiftKey) {
@@ -2267,21 +5058,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     if (!isDragging) return;
                     isDragging = false;
                     this.resizerEl.classList.remove("dragging");
+                    if (this.focusResizerEl) this.focusResizerEl.classList.remove("dragging");
                     document.body.style.cursor = "";
                     document.body.style.userSelect = "";
                 };
 
-                this.resizerEl.addEventListener("mousedown", (e) => {
-                    e.preventDefault();
-                    isDragging = true;
-                    this.resizerEl.classList.add("dragging");
-                    document.body.style.cursor = "ns-resize";
-                    document.body.style.userSelect = "none";
-                });
+                const bindResizerHandle = (handleEl) => {
+                    if (!handleEl) return;
+                    handleEl.addEventListener("mousedown", (e) => {
+                        e.preventDefault();
+                        isDragging = true;
+                        handleEl.classList.add("dragging");
+                        document.body.style.cursor = "ns-resize";
+                        document.body.style.userSelect = "none";
+                    });
+                    handleEl.addEventListener("dblclick", () => {
+                        this.setPinHeightPercent(20);
+                    });
+                };
 
-                this.resizerEl.addEventListener("dblclick", () => {
-                    this.setPinHeightPercent(20);
-                });
+                bindResizerHandle(this.resizerEl);
+                bindResizerHandle(this.focusResizerEl);
 
                 window.addEventListener("mousemove", this.onMouseMove);
                 window.addEventListener("mouseup", this.onMouseUp);
@@ -2293,6 +5090,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 if (this.autoScrollPin && !this.isPinHidden) {
                     this.pinListEl.scrollTop = this.pinListEl.scrollHeight;
+                }
+                if (focusedClient === this && this.focusMsgsEl && this.autoScrollFocusMain) {
+                    this.focusMsgsEl.scrollTop = this.focusMsgsEl.scrollHeight;
+                }
+                if (focusedClient === this && this.focusPinListEl && this.autoScrollFocusPin && !this.isPinHidden) {
+                    this.focusPinListEl.scrollTop = this.focusPinListEl.scrollHeight;
                 }
             }
 
@@ -2327,16 +5130,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
 
             enqueuePinned(role, nickname, color, rawMsg, extras) {
-                this.pendingPinQueue.push({
+                const pinEntry = {
+                    ts: Date.now(),
+                    channelId: this.channel.id,
+                    channelName: this.channel.name,
                     role,
                     nickname,
                     color,
                     rawMsg,
                     extras,
                     timeStr: getTimeString()
-                });
+                };
+                this.recentPins.push(pinEntry);
+                if (this.recentPins.length > 30) {
+                    this.recentPins.shift();
+                }
+                this.pendingPinQueue.push(pinEntry);
                 if (this.pendingPinQueue.length > MAX_PIN_NODES + 20) {
                     this.pendingPinQueue.splice(0, this.pendingPinQueue.length - MAX_PIN_NODES);
+                }
+                if (isCustomFocusChatView() && getFocusedChatSourceSet().has(this.channel.id)) {
+                    focusPendingPinQueue.push(pinEntry);
+                    if (focusPendingPinQueue.length > MAX_PIN_NODES + 20) {
+                        focusPendingPinQueue.splice(0, focusPendingPinQueue.length - MAX_PIN_NODES);
+                    }
                 }
                 scheduleGlobalFlush(this);
             }
@@ -2359,16 +5176,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                 }
 
-                this.pendingMainQueue.push({
+                const chatEntry = {
+                    ts: Number(item?.msgTime) || Date.now(),
+                    channelId: this.channel.id,
+                    channelName: this.channel.name,
                     type: "chat",
                     item,
                     isDonation,
                     parsedProfile,
                     parsedExtras
-                });
+                };
+                this.recentChats.push(chatEntry);
+                if (this.recentChats.length > 100) {
+                    this.recentChats.shift();
+                }
+                this.pendingMainQueue.push(chatEntry);
                 const maxPending = this.autoScrollMain ? MAX_MAIN_NODES_AUTO : MAX_MAIN_NODES_PAUSED;
                 if (this.pendingMainQueue.length > maxPending + 40) {
                     this.pendingMainQueue.splice(0, this.pendingMainQueue.length - maxPending);
+                }
+                if (isCustomFocusChatView() && getFocusedChatSourceSet().has(this.channel.id)) {
+                    focusPendingMainQueue.push(chatEntry);
+                    if (focusPendingMainQueue.length > MAX_MAIN_NODES_PAUSED + 40) {
+                        focusPendingMainQueue.splice(0, focusPendingMainQueue.length - MAX_MAIN_NODES_PAUSED);
+                    }
                 }
                 scheduleGlobalFlush(this);
             }
@@ -2527,7 +5358,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return badge;
             }
 
-            buildPinnedNode(entry) {
+            buildPinnedNode(entry, roomInfo = null) {
                 const isStreamer = entry.role === "streamer";
                 const item = document.createElement("div");
                 item.className = `pinned-item ${isStreamer ? "role-streamer" : "role-manager"}`;
@@ -2546,13 +5377,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 appendFormattedText(textSpan, entry.rawMsg, entry.extras);
 
                 item.appendChild(timeSpan);
+                if (roomInfo) {
+                    item.appendChild(createRoomTagEl(roomInfo.id, roomInfo.name));
+                }
                 item.appendChild(this.createRoleBadge(isStreamer));
                 item.appendChild(nickSpan);
                 item.appendChild(textSpan);
                 return item;
             }
 
-            buildChatNode(item, isDonation, parsedProfile, parsedExtras) {
+            buildChatNode(item, isDonation, parsedProfile, parsedExtras, roomInfo = null) {
                 let profile = parsedProfile || {};
                 let extras = parsedExtras || {};
                 if (!parsedProfile && item.profile) {
@@ -2574,7 +5408,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                     const head = document.createElement("div");
                     head.className = "donation-header";
-                    head.textContent = `🧀 ${nickname} · ${amount}치즈`;
+                    if (roomInfo) {
+                        head.appendChild(createRoomTagEl(roomInfo.id, roomInfo.name));
+                    }
+                    head.appendChild(document.createTextNode(`🧀 ${nickname} · ${amount}치즈`));
 
                     const textDiv = document.createElement("div");
                     textDiv.className = "msg-text";
@@ -2589,6 +5426,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (isStreamer) rowClass += " highlight-streamer";
                 else if (isManager) rowClass += " highlight-manager";
                 div.className = rowClass;
+
+                if (roomInfo) {
+                    div.appendChild(createRoomTagEl(roomInfo.id, roomInfo.name));
+                }
 
                 if (isStreamer || isManager) {
                     div.appendChild(this.createRoleBadge(isStreamer));
@@ -2608,12 +5449,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return div;
             }
 
-            setVideoMessage(msg) {
+            setVideoMessage(msg, isRetryable = false) {
                 if (msg) {
                     this.videoMsgEl.textContent = msg;
+                    this.videoMsgEl.classList.toggle("is-retryable", !!isRetryable);
                     this.videoMsgEl.classList.remove("hidden");
                 } else {
                     this.videoMsgEl.textContent = "";
+                    this.videoMsgEl.classList.remove("is-retryable");
                     this.videoMsgEl.classList.add("hidden");
                 }
             }
@@ -2621,7 +5464,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             setVideoOpen(open) {
                 if (!open && focusedClient === this) {
                     exitFocusMode();
+                } else if (!open && focusedClient && focusAudioOnlyIds.includes(this.channel.id)) {
+                    removeAudioOnlyFromFocus(this);
+                    return;
                 }
+                if (!open) this.isAudioOnlyStream = false;
                 if (this.isVideoOpen === open) return;
                 this.isVideoOpen = open;
                 this.runWithAnchorPreserved(() => {
@@ -2671,9 +5518,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 localStorage.setItem(`chzzk_channel_vol_${this.channel.id}`, String(this.channelVolume));
                 this.applyAudioState();
+                if (focusedClient && !focusRestoring && !focusExiting &&
+                    (focusActiveVideoIds.includes(this.channel.id) || focusAudioOnlyIds.includes(this.channel.id))) {
+                    saveCurrentFocusPreset();
+                    if (focusAudioOnlyIds.includes(this.channel.id)) {
+                        renderFocusVideoHud();
+                        renderFocusRadioDock();
+                    }
+                }
             }
 
-            setVideoMuted(muted) {
+            setVideoMuted(muted, saveWatchPreset = true) {
                 const nextMuted = !!muted;
                 if (!nextMuted && this.channelVolume <= 0) {
                     this.channelVolume = this.lastNonZeroVol > 0 ? this.lastNonZeroVol : 50;
@@ -2681,18 +5536,50 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
                 this.isChannelMuted = nextMuted;
                 this.applyAudioState();
+                if (saveWatchPreset && focusedClient && !focusRestoring && !focusExiting &&
+                    (focusActiveVideoIds.includes(this.channel.id) || focusAudioOnlyIds.includes(this.channel.id))) {
+                    saveCurrentFocusPreset();
+                    if (focusAudioOnlyIds.includes(this.channel.id)) {
+                        renderFocusVideoHud();
+                        renderFocusRadioDock();
+                    }
+                }
             }
 
             toggleVideoMute() {
                 this.setVideoMuted(!this.isChannelMuted);
             }
 
-            applyPreferredVideoLevel() {
+            applyPreferredVideoLevel(smooth = false) {
                 if (!this.hls || !Array.isArray(this.hls.levels) || this.hls.levels.length === 0) return;
                 const levels = this.hls.levels;
                 let chosenIdx = -1;
 
-                if (this.preferredQuality === 0) {
+                if (this.isAudioOnlyStream) {
+                    let bestAudioBitrate = -1;
+                    for (let i = 0; i < levels.length; i++) {
+                        const lv = levels[i];
+                        const isPureAudio = (!lv.height && !lv.width) || !lv.videoCodec;
+                        const b = lv.bitrate || 0;
+                        if (isPureAudio && b > bestAudioBitrate) {
+                            bestAudioBitrate = b;
+                            chosenIdx = i;
+                        }
+                    }
+                    if (chosenIdx === -1) {
+                        let minH = Infinity;
+                        let minB = Infinity;
+                        for (let i = 0; i < levels.length; i++) {
+                            const h = levels[i].height || Infinity;
+                            const b = levels[i].bitrate || Infinity;
+                            if (h < minH || (h === minH && b < minB)) {
+                                minH = h;
+                                minB = b;
+                                chosenIdx = i;
+                            }
+                        }
+                    }
+                } else if (this.preferredQuality === 0) {
                     let maxH = -1;
                     let maxBitrate = -1;
                     for (let i = 0; i < levels.length; i++) {
@@ -2729,11 +5616,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
 
                 if (chosenIdx >= 0) {
-                    this.hls.currentLevel = chosenIdx;
-                    const actualH = levels[chosenIdx].height;
-                    this.videoQualBtn.textContent = actualH
-                        ? `${actualH}p`
-                        : (this.preferredQuality === 0 ? "원본" : `${this.preferredQuality}p`);
+                    if (smooth) {
+                        this.hls.nextLevel = chosenIdx;
+                    } else {
+                        this.hls.currentLevel = chosenIdx;
+                    }
+                    if (this.isAudioOnlyStream) {
+                        this.videoQualBtn.textContent = "라디오";
+                    } else {
+                        const actualH = levels[chosenIdx].height;
+                        this.videoQualBtn.textContent = actualH
+                            ? `${actualH}p`
+                            : (this.preferredQuality === 0 ? "원본" : `${this.preferredQuality}p`);
+                    }
                 }
             }
 
@@ -2747,6 +5642,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             stopVideo() {
                 this.videoLoadSeq += 1;
+                if (this.videoRetryTimer) {
+                    clearTimeout(this.videoRetryTimer);
+                    this.videoRetryTimer = null;
+                }
+                if (this._cancelSwipeScrub) this._cancelSwipeScrub();
+                this.isTimeMachine = false;
+                this.isScrubbingTm = false;
+                this.clearFineSync(true);
+                this.setLiveSyncActive(true);
+                this.videoPanelEl.classList.remove("has-timemachine");
                 if (this.hls) {
                     this.hls.destroy();
                     this.hls = null;
@@ -2755,13 +5660,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 this.videoEl.removeAttribute("src");
                 this.videoEl.load();
                 this.setVideoMessage("");
+                this.updateTimeMachineUI();
             }
 
-            async startVideo() {
+            async startVideo(retryAttempt = 0) {
                 if (this.isDestroyed || !this.isVideoOpen) return;
-                this.stopVideo();
+                if (retryAttempt === 0) {
+                    this.stopVideo();
+                    this.setVideoMessage("방송 스트림 불러오는 중...");
+                } else if (this.videoRetryTimer) {
+                    clearTimeout(this.videoRetryTimer);
+                    this.videoRetryTimer = null;
+                }
                 const seq = this.videoLoadSeq;
-                this.setVideoMessage("방송 스트림 불러오는 중...");
 
                 try {
                     const [res, HlsLib] = await Promise.all([
@@ -2769,30 +5680,73 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         ensureHlsLib()
                     ]);
                     if (this.isDestroyed || !this.isVideoOpen || seq !== this.videoLoadSeq) return;
+                    if (!res.ok) {
+                        throw new Error(`HTTP ${res.status}`);
+                    }
 
                     const info = await res.json();
                     if (info.error || !info.hlsUrl) {
+                        if (info.retryable && retryAttempt < 2) {
+                            throw new Error(info.error || "스트림 일시 오류");
+                        }
                         this.setVideoMessage(info.error || "재생할 수 있는 방송이 없습니다.");
                         return;
                     }
 
                     const badgeTxt = info.category || "LIVE";
-                    this.videoBadgeEl.textContent = info.userCount
-                        ? `${badgeTxt} · ${info.userCount.toLocaleString()}명`
-                        : badgeTxt;
+                    if (this.videoBadgeMetaEl) {
+                        this.videoBadgeMetaEl.textContent = info.userCount
+                            ? `${badgeTxt} · ${info.userCount.toLocaleString()}명`
+                            : badgeTxt;
+                    }
+                    if (this.videoBadgeTitleEl) {
+                        const liveTitle = (info.title || "").trim();
+                        this.videoBadgeTitleEl.textContent = liveTitle;
+                        this.videoBadgeTitleEl.classList.toggle("has-title", !!liveTitle);
+                    }
                     this.videoPanelEl.title = info.title || "";
+                    this.isTimeMachine = !!info.timeMachine;
+                    this.videoPanelEl.classList.toggle("has-timemachine", this.isTimeMachine);
+                    this.setLiveSyncActive(true);
                     this.applyAudioState();
 
+                    const wantAudioOnly = !!this.isAudioOnlyStream;
+                    const primaryUrl = (wantAudioOnly && info.audioOnlyUrl) ? info.audioOnlyUrl : info.hlsUrl;
+                    const primaryTokName = (wantAudioOnly && info.audioOnlyUrl) ? (info.audioOnlySegTokenName || "") : (info.segTokenName || "");
+                    const primaryTokVal = (wantAudioOnly && info.audioOnlyUrl) ? (info.audioOnlySegTokenVal || "") : (info.segTokenVal || "");
+                    const fallbackUrl = (wantAudioOnly && info.audioOnlyUrl) ? info.hlsUrl : info.hlsFallbackUrl;
+                    const fallbackTokName = (wantAudioOnly && info.audioOnlyUrl) ? (info.segTokenName || "") : (info.fallbackSegTokenName || "");
+                    const fallbackTokVal = (wantAudioOnly && info.audioOnlyUrl) ? (info.segTokenVal || "") : (info.fallbackSegTokenVal || "");
+
                     if (HlsLib && HlsLib.isSupported()) {
+                        let activeTokName = primaryTokName;
+                        let activeTokVal = primaryTokVal;
+                        const DefaultLoader = HlsLib.DefaultConfig.loader;
+                        class ChzzkSegLoader extends DefaultLoader {
+                            load(context, config, callbacks) {
+                                if (activeTokName && activeTokVal && context && typeof context.url === "string") {
+                                    if (
+                                        /\.(m4v|m4s|mp4|ts)(\?|$)/i.test(context.url) &&
+                                        !context.url.includes(`${activeTokName}=`)
+                                    ) {
+                                        const sep = context.url.includes("?") ? "&" : "?";
+                                        context.url = `${context.url}${sep}${activeTokName}=${activeTokVal}`;
+                                    }
+                                }
+                                super.load(context, config, callbacks);
+                            }
+                        }
+
                         const hls = new HlsLib({
+                            loader: ChzzkSegLoader,
                             lowLatencyMode: true,
                             autoStartLoad: false,
                             liveSyncDuration: 2.0,
                             liveMaxLatencyDuration: 3.5,
                             maxLiveSyncPlaybackRate: 1.25,
-                            maxBufferLength: 4,
-                            maxMaxBufferLength: 8,
-                            backBufferLength: 4,
+                            maxBufferLength: this.isTimeMachine ? 6 : 4,
+                            maxMaxBufferLength: this.isTimeMachine ? 12 : 8,
+                            backBufferLength: this.isTimeMachine ? 30 : 4,
                             capLevelToPlayerSize: false
                         });
                         this.hls = hls;
@@ -2805,6 +5759,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             hls.startLoad(-1);
                             this.setVideoMessage("");
                             this.videoEl.play().catch(() => {});
+                            this.updateTimeMachineUI();
+                        });
+
+                        hls.on(HlsLib.Events.LEVEL_UPDATED, () => {
+                            if (this.isDestroyed || seq !== this.videoLoadSeq) return;
+                            this.keepInsideSlidingWindow();
+                            this.updateTimeMachineUI();
                         });
 
                         hls.on(HlsLib.Events.ERROR, (evt, data) => {
@@ -2814,30 +5775,287 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 hls.recoverMediaError();
                                 return;
                             }
-                            if (!usedFallback && info.hlsFallbackUrl) {
+                            if (!usedFallback && fallbackUrl) {
                                 usedFallback = true;
-                                hls.loadSource(info.hlsFallbackUrl);
+                                activeTokName = fallbackTokName;
+                                activeTokVal = fallbackTokVal;
+                                hls.loadSource(fallbackUrl);
                                 return;
                             }
                             this.setVideoMessage("영상 연결이 끊어졌습니다. (↻ 새로고침)");
                         });
 
-                        hls.loadSource(info.hlsUrl);
+                        hls.loadSource(primaryUrl);
                         hls.attachMedia(this.videoEl);
                     } else if (this.videoEl.canPlayType("application/vnd.apple.mpegurl")) {
-                        this.videoEl.src = info.hlsUrl;
+                        this.videoEl.src = primaryUrl;
                         this.setVideoMessage("");
                         this.videoEl.play().catch(() => {});
+                        this.updateTimeMachineUI();
                     } else {
                         this.setVideoMessage("이 브라우저는 HLS 재생을 지원하지 않습니다.");
                     }
                 } catch (err) {
-                    if (this.isDestroyed || seq !== this.videoLoadSeq) return;
-                    this.setVideoMessage("영상 로드 중 오류가 발생했습니다.");
+                    if (this.isDestroyed || !this.isVideoOpen || seq !== this.videoLoadSeq) return;
+                    if (retryAttempt < 2) {
+                        const nextAttempt = retryAttempt + 1;
+                        const delayMs = retryAttempt === 0 ? 700 : 1600;
+                        this.setVideoMessage(`영상 연결 재시도 중... (${nextAttempt}/2)`);
+                        this.videoRetryTimer = setTimeout(() => {
+                            this.videoRetryTimer = null;
+                            if (!this.isDestroyed && this.isVideoOpen && seq === this.videoLoadSeq) {
+                                this.startVideo(nextAttempt);
+                            }
+                        }, delayMs);
+                        return;
+                    }
+                    const reason = err && err.message ? err.message : "일시 오류";
+                    this.setVideoMessage(`영상 로드 오류 (${reason}) · 클릭하여 재시도`, true);
                 }
             }
 
+            getSeekRange() {
+                try {
+                    const sk = this.videoEl.seekable;
+                    if (!sk || sk.length === 0) return null;
+                    const start = sk.start(0);
+                    const end = sk.end(sk.length - 1);
+                    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+                    const span = end - start;
+                    const leftMargin = span > 40 ? 18 : Math.min(6, span * 0.15);
+                    const safeEnd = Math.max(start, end - 1.2);
+                    const safeStart = Math.min(safeEnd, start + leftMargin);
+                    return {
+                        start,
+                        end,
+                        span,
+                        safeStart,
+                        safeEnd,
+                        safeSpan: Math.max(0, end - safeStart),
+                    };
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            keepInsideSlidingWindow() {
+                if (!this.isTimeMachine || this.isLivePinned || this.isScrubbingTm) return;
+                const range = this.getSeekRange();
+                if (!range || range.span <= 15) return;
+                const cur = Number.isFinite(this.videoEl.currentTime) ? this.videoEl.currentTime : range.end;
+                if (cur < range.start + 8 && range.end - (range.start + 14) > 4.5) {
+                    try {
+                        this.videoEl.currentTime = range.start + 14;
+                    } catch (e) {}
+                }
+            }
+
+            formatOffsetLabel(behindSec) {
+                const sec = Math.max(0, Math.round(behindSec));
+                const h = Math.floor(sec / 3600);
+                const m = Math.floor((sec % 3600) / 60);
+                const s = sec % 60;
+                const mm = String(m).padStart(2, "0");
+                const ss = String(s).padStart(2, "0");
+                return h > 0 ? `-${h}:${mm}:${ss}` : `-${mm}:${ss}`;
+            }
+
+            applyHlsLiveConfig() {
+                const allowCatchUp = this.isLivePinned && !this.hasManualSyncHold;
+                if (this.hls && this.hls.config) {
+                    this.hls.config.liveMaxLatencyDuration = allowCatchUp ? 3.5 : Infinity;
+                    this.hls.config.maxLiveSyncPlaybackRate = allowCatchUp ? 1.25 : 1;
+                }
+                if (!allowCatchUp && !this.fineSyncTimer && this.videoEl.playbackRate !== 1) {
+                    this.videoEl.playbackRate = 1;
+                }
+            }
+
+            setLiveSyncActive(active) {
+                this.isLivePinned = !!active;
+                this.applyHlsLiveConfig();
+            }
+
+            updateFineSyncBadge(note = "") {
+                if (!this.syncBadgeEl) return;
+                if (note) {
+                    this.syncBadgeEl.textContent = note;
+                    this.syncBadgeEl.classList.remove("hidden", "adjusting");
+                    return;
+                }
+                const adjusting = Math.abs(this.fineSyncRemainingSec) >= 0.015;
+                const rounded = Math.round(this.manualSyncOffsetSec * 10) / 10;
+                if (!adjusting && Math.abs(rounded) < 0.05) {
+                    this.syncBadgeEl.textContent = "";
+                    this.syncBadgeEl.classList.add("hidden");
+                    this.syncBadgeEl.classList.remove("adjusting");
+                    return;
+                }
+                const sign = rounded > 0 ? "+" : "";
+                this.syncBadgeEl.textContent = `${adjusting ? "▶" : ""}${sign}${rounded.toFixed(1)}s`;
+                this.syncBadgeEl.classList.remove("hidden");
+                this.syncBadgeEl.classList.toggle("adjusting", adjusting);
+            }
+
+            clearFineSync(resetOffset = true) {
+                if (this.fineSyncTimer) {
+                    clearInterval(this.fineSyncTimer);
+                    this.fineSyncTimer = null;
+                }
+                this.fineSyncRemainingSec = 0;
+                if (resetOffset) {
+                    this.hasManualSyncHold = false;
+                    this.manualSyncOffsetSec = 0;
+                }
+                if (this.videoEl && this.videoEl.playbackRate !== 1) {
+                    this.videoEl.playbackRate = 1;
+                }
+                this.applyHlsLiveConfig();
+                this.updateFineSyncBadge();
+            }
+
+            getForwardHeadroomSec() {
+                try {
+                    const cur = Number.isFinite(this.videoEl.currentTime) ? this.videoEl.currentTime : 0;
+                    const range = this.getSeekRange();
+                    if (range) {
+                        return Math.max(0, range.end - cur);
+                    }
+                    const buf = this.videoEl.buffered;
+                    if (buf && buf.length > 0) {
+                        return Math.max(0, buf.end(buf.length - 1) - cur);
+                    }
+                } catch (e) {}
+                return 0;
+            }
+
+            adjustFineSync(deltaSec) {
+                if (this.isDestroyed || !this.isVideoOpen || !this.videoEl) return;
+                if (deltaSec > 0 && this.getForwardHeadroomSec() <= 0.55) {
+                    if (this.fineSyncRemainingSec > 0) {
+                        this.fineSyncRemainingSec = 0;
+                        this.videoEl.playbackRate = 1;
+                    }
+                    showUndoToast("이미 최신 라이브 끝단에 가까워 더 당길 수 없습니다.", null);
+                    return;
+                }
+
+                this.hasManualSyncHold = true;
+                this.fineSyncRemainingSec += deltaSec;
+                this.applyHlsLiveConfig();
+                this.updateFineSyncBadge();
+
+                if (this.fineSyncTimer) return;
+                this.fineSyncLastTs = performance.now();
+                this.fineSyncTimer = setInterval(() => {
+                    const now = performance.now();
+                    const dt = Math.min(0.25, Math.max(0, (now - this.fineSyncLastTs) / 1000));
+                    this.fineSyncLastTs = now;
+
+                    if (this.isDestroyed || !this.isVideoOpen || !this.videoEl) {
+                        this.clearFineSync(true);
+                        return;
+                    }
+                    if (this.videoEl.paused || this.videoEl.seeking || this.videoEl.readyState < 2) {
+                        return;
+                    }
+                    if (Math.abs(this.fineSyncRemainingSec) < 0.015) {
+                        this.clearFineSync(false);
+                        return;
+                    }
+
+                    if (this.fineSyncRemainingSec < 0) {
+                        const rate = 0.75;
+                        this.videoEl.playbackRate = rate;
+                        const achieved = (rate - 1.0) * dt; // 음수 (지연량)
+                        const step = Math.max(this.fineSyncRemainingSec, achieved);
+                        this.fineSyncRemainingSec -= step;
+                        this.manualSyncOffsetSec += step;
+                    } else {
+                        if (this.getForwardHeadroomSec() <= 0.45) {
+                            this.fineSyncRemainingSec = 0;
+                            this.clearFineSync(false);
+                            return;
+                        }
+                        const rate = 1.25;
+                        this.videoEl.playbackRate = rate;
+                        const achieved = (rate - 1.0) * dt; // 양수 (당김량)
+                        const step = Math.min(this.fineSyncRemainingSec, achieved);
+                        this.fineSyncRemainingSec -= step;
+                        this.manualSyncOffsetSec += step;
+                    }
+
+                    if (Math.abs(this.fineSyncRemainingSec) < 0.015) {
+                        this.clearFineSync(false);
+                    } else {
+                        this.updateFineSyncBadge();
+                    }
+                }, 40);
+            }
+
+            seekRelative(deltaSec) {
+                if (!this.isTimeMachine) return;
+                const range = this.getSeekRange();
+                if (!range) return;
+                const base = Number.isFinite(this.videoEl.currentTime) ? this.videoEl.currentTime : range.end;
+                this.seekToTime(base + deltaSec);
+            }
+
+            seekToTime(targetSec) {
+                if (!this.isTimeMachine) return;
+                const range = this.getSeekRange();
+                if (!range) return;
+                this.clearFineSync(true);
+                const clamped = Math.max(range.safeStart, Math.min(range.safeEnd, targetSec));
+                if (range.end - clamped <= 4.0) {
+                    this.returnToLiveEdge();
+                    return;
+                }
+                this.setLiveSyncActive(false);
+                try {
+                    this.videoEl.currentTime = clamped;
+                } catch (e) {}
+                this.videoEl.play().catch(() => {});
+                this.updateTimeMachineUI();
+            }
+
+            returnToLiveEdge() {
+                this.clearFineSync(true);
+                this.setLiveSyncActive(true);
+                const range = this.getSeekRange();
+                try {
+                    if (this.hls && typeof this.hls.liveSyncPosition === "number" && this.hls.liveSyncPosition > 0) {
+                        this.videoEl.currentTime = this.hls.liveSyncPosition;
+                    } else if (range) {
+                        this.videoEl.currentTime = Math.max(range.safeStart, range.end - 1.8);
+                    }
+                } catch (e) {}
+                this.videoEl.play().catch(() => {});
+                this.updateTimeMachineUI();
+            }
+
+            updateTimeMachineUI() {
+                if (!this.tmSlider || !this.tmTimeEl || !this.tmLiveBtn) return;
+                const range = this.getSeekRange();
+                if (!this.isTimeMachine || !range || range.safeSpan <= 0.5) {
+                    this.tmSlider.value = "1000";
+                    this.tmTimeEl.textContent = "실시간";
+                    this.tmLiveBtn.classList.add("is-live");
+                    return;
+                }
+                const cur = Number.isFinite(this.videoEl.currentTime) ? this.videoEl.currentTime : range.end;
+                const behind = Math.max(0, range.end - cur);
+                const atLive = this.isLivePinned || behind <= 4.0;
+                if (!this.isScrubbingTm) {
+                    const ratio = Math.max(0, Math.min(1, (cur - range.safeStart) / range.safeSpan));
+                    this.tmSlider.value = String(Math.round(ratio * 1000));
+                }
+                this.tmTimeEl.textContent = atLive ? "실시간" : this.formatOffsetLabel(behind);
+                this.tmLiveBtn.classList.toggle("is-live", atLive);
+            }
+
             snapToLiveEdge() {
+                if (!this.isLivePinned || this.hasManualSyncHold) return;
                 try {
                     if (this.hls && typeof this.hls.liveSyncPosition === "number" && this.hls.liveSyncPosition > 0) {
                         if (this.hls.liveSyncPosition - this.videoEl.currentTime > 3.5) {
@@ -2845,6 +6063,166 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         }
                     }
                 } catch (e) {}
+            }
+
+            setupSwipeTimeMachine() {
+                let pointerDown = false;
+                let holdActive = false;
+                let didMove = false;
+                let startX = 0;
+                let startY = 0;
+                let holdTimer = null;
+                let rangeCache = null;
+                let baseTime = 0;
+                let swipeTargetSec = null;
+
+                const resetSwipeState = () => {
+                    pointerDown = false;
+                    holdActive = false;
+                    didMove = false;
+                    rangeCache = null;
+                    swipeTargetSec = null;
+                    if (holdTimer) {
+                        clearTimeout(holdTimer);
+                        holdTimer = null;
+                    }
+                    if (this.videoSwipeHudEl) {
+                        this.videoSwipeHudEl.textContent = "";
+                        this.videoSwipeHudEl.classList.add("hidden");
+                    }
+                    if (document.body.style.cursor === "ew-resize") {
+                        document.body.style.cursor = "";
+                    }
+                };
+                this._cancelSwipeScrub = resetSwipeState;
+
+                this.videoPanelEl.addEventListener("mousedown", (e) => {
+                    if (e.button !== 0 || !this.isVideoOpen) return;
+                    if (e.target.closest(".video-overlay, .video-info-badge")) return;
+                    resetSwipeState();
+                    pointerDown = true;
+                    startX = e.clientX;
+                    startY = e.clientY;
+                    holdTimer = setTimeout(() => {
+                        holdTimer = null;
+                        if (!pointerDown || this.isDestroyed || !this.isVideoOpen) return;
+                        holdActive = true;
+                        this.suppressDblClickUntil = Date.now() + 700;
+                        if (!this.isTimeMachine) {
+                            if (this.videoSwipeHudEl) {
+                                this.videoSwipeHudEl.textContent = "타임머신 미지원 방송";
+                                this.videoSwipeHudEl.classList.remove("hidden");
+                            }
+                            return;
+                        }
+                        rangeCache = this.getSeekRange();
+                        if (!rangeCache || rangeCache.safeSpan <= 0.5) {
+                            if (this.videoSwipeHudEl) {
+                                this.videoSwipeHudEl.textContent = "이동 가능한 구간이 부족합니다";
+                                this.videoSwipeHudEl.classList.remove("hidden");
+                            }
+                            rangeCache = null;
+                            return;
+                        }
+                        baseTime = Number.isFinite(this.videoEl.currentTime) ? this.videoEl.currentTime : rangeCache.end;
+                        swipeTargetSec = baseTime;
+                        if (this.videoSwipeHudEl) {
+                            this.videoSwipeHudEl.textContent = "↔ 좌우 스와이프 (Shift: 미세)";
+                            this.videoSwipeHudEl.classList.remove("hidden");
+                        }
+                        document.body.style.cursor = "ew-resize";
+                    }, 220);
+                });
+
+                this._onSwipeMove = (e) => {
+                    if (!pointerDown) return;
+                    if (!holdActive) {
+                        if (Math.hypot(e.clientX - startX, e.clientY - startY) > 8) {
+                            resetSwipeState();
+                        }
+                        return;
+                    }
+                    if (!this.isTimeMachine || !rangeCache) return;
+                    const dx = e.clientX - startX;
+                    if (Math.abs(dx) >= 6) didMove = true;
+                    const ratePerPx = e.shiftKey ? 0.1 : 0.5;
+                    swipeTargetSec = Math.max(rangeCache.safeStart, Math.min(rangeCache.safeEnd, baseTime + dx * ratePerPx));
+                    const behind = Math.max(0, rangeCache.end - swipeTargetSec);
+                    const delta = Math.round(swipeTargetSec - baseTime);
+                    const arrow = delta < 0 ? "⏪" : (delta > 0 ? "⏩" : "⏱");
+                    const clock = formatClockTime(Date.now() - behind * 1000);
+                    const offsetTxt = behind <= 4 ? "실시간" : this.formatOffsetLabel(behind);
+                    if (this.videoSwipeHudEl) {
+                        this.videoSwipeHudEl.textContent = `${arrow} ${offsetTxt} · ${clock}`;
+                        this.videoSwipeHudEl.classList.remove("hidden");
+                    }
+                };
+
+                this._onSwipeUp = () => {
+                    if (!pointerDown && !holdActive) return;
+                    const commitTarget = (holdActive && didMove && this.isTimeMachine && swipeTargetSec !== null)
+                        ? swipeTargetSec
+                        : null;
+                    if (holdActive) {
+                        this.suppressDblClickUntil = Date.now() + 450;
+                    }
+                    resetSwipeState();
+                    if (commitTarget !== null) {
+                        this.seekToTime(commitTarget);
+                    }
+                };
+
+                window.addEventListener("mousemove", this._onSwipeMove);
+                window.addEventListener("mouseup", this._onSwipeUp);
+                window.addEventListener("blur", resetSwipeState);
+                this._onSwipeBlur = resetSwipeState;
+            }
+
+            setupBadgeDragSwap() {
+                if (!this.videoBadgeEl || !this.videoPanelEl) return;
+                this.videoBadgeEl.addEventListener("click", (e) => {
+                    if (!focusedClient) return;
+                    e.stopPropagation();
+                    window.open(`https://chzzk.naver.com/live/${this.channel.id}`, "_blank", "noopener");
+                });
+                this.videoBadgeEl.addEventListener("dblclick", (e) => {
+                    e.stopPropagation();
+                });
+                this.videoBadgeEl.addEventListener("dragstart", (e) => {
+                    if (!focusedClient || focusActiveVideoIds.length < 2) {
+                        e.preventDefault();
+                        return;
+                    }
+                    dragSourceFocusId = this.channel.id;
+                    if (e.dataTransfer) {
+                        e.dataTransfer.effectAllowed = "move";
+                        e.dataTransfer.setData("text/plain", this.channel.id);
+                    }
+                });
+                this.videoPanelEl.addEventListener("dragover", (e) => {
+                    if (!focusedClient || !dragSourceFocusId || dragSourceFocusId === this.channel.id) return;
+                    if (!focusActiveVideoIds.includes(this.channel.id)) return;
+                    e.preventDefault();
+                    this.videoPanelEl.classList.add("drag-over");
+                });
+                this.videoPanelEl.addEventListener("dragleave", (e) => {
+                    if (e.relatedTarget && this.videoPanelEl.contains(e.relatedTarget)) return;
+                    this.videoPanelEl.classList.remove("drag-over");
+                });
+                this.videoPanelEl.addEventListener("drop", (e) => {
+                    if (!focusedClient || !focusActiveVideoIds.includes(this.channel.id)) return;
+                    const srcId = dragSourceFocusId || e.dataTransfer?.getData("text/plain");
+                    dragSourceFocusId = null;
+                    this.videoPanelEl.classList.remove("drag-over");
+                    if (srcId && srcId !== this.channel.id) {
+                        e.preventDefault();
+                        swapFocusStreams(srcId, this.channel.id);
+                    }
+                });
+                this.videoBadgeEl.addEventListener("dragend", () => {
+                    dragSourceFocusId = null;
+                    clientMap.forEach(c => c.videoPanelEl.classList.remove("drag-over"));
+                });
             }
 
             disconnectSocket() {
@@ -2869,12 +6247,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             destroy() {
                 if (focusedClient === this) {
                     exitFocusMode(true);
+                } else if (focusedClient && focusActiveVideoIds.includes(this.channel.id)) {
+                    removeStreamFromFocus(this);
+                } else if (focusedClient && focusAudioOnlyIds.includes(this.channel.id)) {
+                    removeAudioOnlyFromFocus(this);
                 }
+                focusStreamSavedStates.delete(this.channel.id);
                 this.isDestroyed = true;
                 this.isConnecting = false;
                 dirtyClients.delete(this);
                 this.pendingMainQueue.length = 0;
                 this.pendingPinQueue.length = 0;
+                this.recentChats.length = 0;
+                this.recentPins.length = 0;
+                this.clearFineSync(true);
                 if (this.livePollTimer) {
                     clearInterval(this.livePollTimer);
                     this.livePollTimer = null;
@@ -2884,6 +6270,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (this.ro) this.ro.disconnect();
                 window.removeEventListener("mousemove", this.onMouseMove);
                 window.removeEventListener("mouseup", this.onMouseUp);
+                if (this._onSwipeMove) window.removeEventListener("mousemove", this._onSwipeMove);
+                if (this._onSwipeUp) window.removeEventListener("mouseup", this._onSwipeUp);
+                if (this._onSwipeBlur) window.removeEventListener("blur", this._onSwipeBlur);
                 this.container.remove();
             }
         }
@@ -2910,13 +6299,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("btn-empty-add").onclick = openManageModal;
                 localStorage.setItem(STORAGE_CHANNELS_KEY, "[]");
                 renderModalActiveList();
+                syncModeDockUI();
                 return;
             }
 
             const emptyScreen = wrapper.querySelector(".empty-screen");
             if (emptyScreen) emptyScreen.remove();
 
-            wrapper.style.gridTemplateColumns = `repeat(${activeChannels.length}, 1fr)`;
+            wrapper.style.gridTemplateColumns = isHScrollMode
+                ? `repeat(${activeChannels.length}, minmax(260px, 1fr))`
+                : `repeat(${activeChannels.length}, 1fr)`;
 
             activeChannels.forEach((ch) => {
                 let client = clientMap.get(ch.id);
@@ -2933,6 +6325,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             localStorage.setItem(STORAGE_CHANNELS_KEY, JSON.stringify(activeChannels));
             renderModalActiveList();
+            syncModeDockUI();
         }
 
         let saveHistoryTimer = null;
@@ -2955,21 +6348,127 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 setSearchStatus("이미 화면에 추가된 스트리머입니다.");
                 return false;
             }
-            if (activeChannels.length >= 6) {
-                setSearchStatus("최대 6명까지만 동시에 볼 수 있습니다. 기존 칸을 닫고 추가하세요.");
-                return false;
-            }
             activeChannels.push({ id: ch.id, name: ch.name });
             syncLayout();
             scheduleSaveHistoryToServer();
             return true;
         }
 
-        function removeChannel(targetId) {
-            if (activeChannels.length <= 1) return;
+        const closedChannelStack = [];
+        const redoChannelStack = [];
+        let undoToastTimer = null;
+        let undoToastMode = null;
+
+        function showUndoToast(message, actionMode = null) {
+            const toast = document.getElementById("undo-toast");
+            const msgEl = document.getElementById("undo-toast-msg");
+            const btnEl = document.getElementById("undo-toast-btn");
+            if (!toast || !msgEl || !btnEl) return;
+            msgEl.textContent = message;
+            undoToastMode = actionMode;
+            if (actionMode === "undo") {
+                btnEl.textContent = "Ctrl+Z 되돌리기";
+                btnEl.style.display = "inline-block";
+            } else if (actionMode === "redo") {
+                btnEl.textContent = "Ctrl+Y 다시 닫기";
+                btnEl.style.display = "inline-block";
+            } else {
+                btnEl.style.display = "none";
+            }
+            toast.classList.add("visible");
+            if (undoToastTimer) clearTimeout(undoToastTimer);
+            undoToastTimer = setTimeout(() => {
+                toast.classList.remove("visible");
+                undoToastTimer = null;
+                undoToastMode = null;
+            }, 3000);
+        }
+
+        const undoToastBtnEl = document.getElementById("undo-toast-btn");
+        if (undoToastBtnEl) {
+            undoToastBtnEl.onclick = () => {
+                if (undoToastMode === "redo") {
+                    redoCloseChannel();
+                } else if (undoToastMode === "undo") {
+                    undoCloseChannel();
+                }
+            };
+        }
+
+        function removeChannel(targetId, fromRedo = false) {
+            if (activeChannels.length <= 1) return false;
+            const idx = activeChannels.findIndex(c => c.id === targetId);
+            if (idx === -1) return false;
+            if (!fromRedo) {
+                redoChannelStack.length = 0;
+            }
+            const removed = activeChannels[idx];
+            const client = clientMap.get(targetId);
+            closedChannelStack.push({
+                id: removed.id,
+                name: removed.name,
+                index: idx,
+                isVideoOpen: !!(client && client.isVideoOpen),
+                preferredQuality: client ? client.preferredQuality : 360,
+                isChannelMuted: client ? client.isChannelMuted : true,
+            });
+            if (closedChannelStack.length > 20) {
+                closedChannelStack.shift();
+            }
             activeChannels = activeChannels.filter(c => c.id !== targetId);
             syncLayout();
             scheduleSaveHistoryToServer();
+            showUndoToast(fromRedo ? `↪ ${removed.name} 다시 닫힘` : `${removed.name} 닫힘`, "undo");
+            return true;
+        }
+
+        function undoCloseChannel() {
+            while (closedChannelStack.length > 0) {
+                const candidate = closedChannelStack[closedChannelStack.length - 1];
+                if (activeChannels.some(c => c.id === candidate.id)) {
+                    closedChannelStack.pop();
+                    continue;
+                }
+                const entry = closedChannelStack.pop();
+                const insertIdx = Math.max(0, Math.min(entry.index, activeChannels.length));
+                activeChannels.splice(insertIdx, 0, { id: entry.id, name: entry.name });
+                syncLayout();
+                scheduleSaveHistoryToServer();
+
+                const restored = clientMap.get(entry.id);
+                if (restored) {
+                    restored.preferredQuality = entry.preferredQuality ?? 360;
+                    restored.videoQualBtn.textContent = restored.preferredQuality === 0 ? "원본" : `${restored.preferredQuality}p`;
+                    restored.setVideoMuted(entry.isChannelMuted);
+                    if (entry.isVideoOpen) {
+                        restored.setVideoOpen(true);
+                    }
+                }
+                redoChannelStack.push(entry);
+                if (redoChannelStack.length > 20) {
+                    redoChannelStack.shift();
+                }
+                showUndoToast(`↩ ${entry.name} 복구됨`, "redo");
+                return true;
+            }
+            return false;
+        }
+
+        function redoCloseChannel() {
+            while (redoChannelStack.length > 0) {
+                const candidate = redoChannelStack[redoChannelStack.length - 1];
+                if (!activeChannels.some(c => c.id === candidate.id)) {
+                    redoChannelStack.pop();
+                    continue;
+                }
+                if (activeChannels.length <= 1) {
+                    showUndoToast("최소 1개 채널은 남겨야 합니다.", null);
+                    return false;
+                }
+                redoChannelStack.pop();
+                return removeChannel(candidate.id, true);
+            }
+            return false;
         }
 
         function moveChannel(index, direction) {
@@ -3094,12 +6593,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function applyComboFromHistory(comboIdx) {
-            const combo = modalHistory[comboIdx];
+            const entry = modalHistory[comboIdx];
+            const combo = Array.isArray(entry) ? entry : entry?.channels;
             if (!Array.isArray(combo) || combo.length === 0) return;
-            activeChannels = combo.slice(0, 6).map(c => ({ id: c.id, name: c.name }));
+            activeChannels = combo.map(c => ({ id: c.id, name: c.name }));
             syncLayout();
             scheduleSaveHistoryToServer();
             closeModal();
+        }
+
+        async function toggleHistoryPin(comboIdx) {
+            try {
+                const res = await fetch("/api/history/pin", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ index: comboIdx })
+                });
+                const data = await res.json();
+                if (data.ok && Array.isArray(data.history)) {
+                    modalHistory = data.history;
+                    renderModalHistory();
+                }
+            } catch (e) {}
         }
 
         async function deleteHistoryEntry(comboIdx) {
@@ -3123,21 +6638,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const titleEl = document.getElementById("history-section-title");
             if (!listEl) return;
 
-            titleEl.textContent = "📜 최근 기록 (칩 클릭: 1명 추가 / 우클릭: 메뉴)";
+            titleEl.textContent = "📜 스크립트 최근 기록 (📌 고정 · 칩 클릭: 1명 추가)";
             countEl.textContent = `${modalHistory.length} / 9`;
             listEl.innerHTML = "";
 
             if (modalHistory.length === 0) {
                 const empty = document.createElement("div");
                 empty.className = "history-empty";
-                empty.textContent = "저장된 최근 기록이 없습니다.";
+                empty.textContent = "스크립트에서 입력한 최근 기록이 없습니다.";
                 listEl.appendChild(empty);
                 return;
             }
 
-            modalHistory.forEach((combo, comboIdx) => {
+            modalHistory.forEach((rawEntry, comboIdx) => {
+                const isPinned = !Array.isArray(rawEntry) && !!rawEntry?.pinned;
+                const combo = Array.isArray(rawEntry) ? rawEntry : (rawEntry?.channels || []);
+                if (!Array.isArray(combo) || combo.length === 0) return;
+
                 const row = document.createElement("div");
-                row.className = "history-row";
+                row.className = `history-row${isPinned ? " pinned" : ""}`;
                 row.oncontextmenu = (e) => {
                     if (!e.target.closest(".history-chip")) {
                         openHistoryContextMenu(e, comboIdx, null);
@@ -3164,6 +6683,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 const actionsEl = document.createElement("div");
                 actionsEl.className = "history-actions";
+
+                const pinBtn = document.createElement("button");
+                pinBtn.type = "button";
+                pinBtn.className = `btn-mini btn-history-pin${isPinned ? " pinned" : ""}`;
+                pinBtn.textContent = "📌";
+                pinBtn.title = isPinned ? "고정 해제" : "상단에 고정 (새 기록이 쌓여도 유지)";
+                pinBtn.onclick = () => toggleHistoryPin(comboIdx);
+                actionsEl.appendChild(pinBtn);
 
                 const loadBtn = document.createElement("button");
                 loadBtn.type = "button";
@@ -3217,7 +6744,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const countLabel = document.getElementById("active-count-label");
             if (!listEl) return;
 
-            countLabel.textContent = `${activeChannels.length} / 6`;
+            countLabel.textContent = `${activeChannels.length}개`;
             listEl.innerHTML = "";
 
             activeChannels.forEach((ch, idx) => {
@@ -3555,11 +7082,23 @@ class MultiChatHandler(BaseHTTPRequestHandler):
             if body is None:
                 self.send_bytes(400, "application/json; charset=utf-8", b'{"ok":false}')
                 return
+            # 웹 화면 편집은 현재 세션 새로고침용 상태만 갱신하고, 스크립트 최근 기록 파일에는 쓰지 않음
             if channels:
                 with history_lock:
                     INITIAL_CHANNELS = channels
-                record_history_entry(channels)
             self.send_bytes(200, "application/json; charset=utf-8", b'{"ok":true}')
+
+        elif parsed.path == "/api/history/pin":
+            body = self.read_json_body()
+            if not isinstance(body, dict) or not isinstance(body.get("index"), int):
+                self.send_bytes(400, "application/json; charset=utf-8", b'{"ok":false}')
+                return
+            updated = toggle_history_pin(body["index"])
+            self.send_bytes(
+                200,
+                "application/json; charset=utf-8",
+                json.dumps({"ok": True, "history": updated}, ensure_ascii=False).encode("utf-8"),
+            )
 
         elif parsed.path == "/api/history/delete":
             body = self.read_json_body()
@@ -3570,7 +7109,7 @@ class MultiChatHandler(BaseHTTPRequestHandler):
             history = load_history()
             if 0 <= idx < len(history):
                 history.pop(idx)
-                save_history(history)
+                history = save_history(history)
             self.send_bytes(
                 200,
                 "application/json; charset=utf-8",
@@ -3606,10 +7145,11 @@ def print_history(history):
     if not history:
         return
     print("--------------------------------------------------")
-    print(f" 📜 최근 기록 (최대 {MAX_HISTORY}개):")
+    print(f" 📜 스크립트 최근 기록 (최대 {MAX_HISTORY}개 · 📌 고정):")
     for idx, entry in enumerate(history, 1):
-        names = ", ".join(ch["name"] for ch in entry)
-        print(f"   [{idx}] {names}")
+        pin_mark = "📌 " if entry.get("pinned") else ""
+        names = ", ".join(ch["name"] for ch in entry["channels"])
+        print(f"   [{idx}] {pin_mark}{names}")
     print("--------------------------------------------------")
 
 def load_prompt_toolkit():
@@ -3680,13 +7220,16 @@ def build_history_fragments(pt, history, buf):
 
     frags = [
         ("fg:#52525b", "--------------------------------------------------\n"),
-        ("fg:#a1a1aa bold", f" 📜 최근 기록 (클릭해서 입력 · 최대 {MAX_HISTORY}개)\n"),
+        ("fg:#a1a1aa bold", f" 📜 스크립트 최근 기록 (클릭해서 입력 · 최대 {MAX_HISTORY}개 · 📌 고정)\n"),
     ]
     for idx, entry in enumerate(history, 1):
         frags.append(("", "   "))
-        frags.append(("fg:#00ffa3 bold", f"[{idx}]", make_click_handler(str(idx))))
+        if entry.get("pinned"):
+            frags.append(("fg:#00ffa3 bold", f"[{idx}]📌", make_click_handler(str(idx))))
+        else:
+            frags.append(("fg:#00ffa3 bold", f"[{idx}]", make_click_handler(str(idx))))
         frags.append(("", " "))
-        for sub_idx, ch in enumerate(entry):
+        for sub_idx, ch in enumerate(entry["channels"]):
             if sub_idx > 0:
                 frags.append(("fg:#71717a", ", "))
             frags.append(("fg:#e4e4e7", ch["name"], make_click_handler(ch["name"])))
@@ -3696,7 +7239,7 @@ def build_history_fragments(pt, history, buf):
 def read_cli_input(pt, history):
     """회색 placeholder와 하단 클릭형 최근 기록을 포함한 CLI 입력을 받습니다."""
     if history:
-        recent_names = ", ".join(ch["name"] for ch in history[0])
+        recent_names = ", ".join(ch["name"] for ch in history[0]["channels"])
         ghost = f"직전: {recent_names} (엔터 시 실행)"
     else:
         ghost = "예: 침착맨, 주호민 또는 채널 ID / 치지직 주소"
@@ -3758,7 +7301,7 @@ def find_in_history_by_name(name, history):
     """입력한 이름이 최근 기록에 정확히 있으면 캐시된 채널을 즉시 반환합니다."""
     norm = "".join(name.split()).lower()
     for entry in history:
-        for ch in entry:
+        for ch in entry["channels"]:
             if "".join(ch["name"].split()).lower() == norm:
                 return ch
     return None
@@ -3770,34 +7313,31 @@ def resolve_cli_inputs(raw_input, history):
     seen_ids = set()
 
     def append_unique(ch):
-        if len(resolved) >= 6:
-            return
         if ch["id"] not in seen_ids:
             seen_ids.add(ch["id"])
             resolved.append({"id": ch["id"], "name": ch["name"]})
 
     for tok in tokens:
-        if len(resolved) >= 6:
-            break
 
         if history and len(tok) == 1 and tok in "123456789":
             c_idx = int(tok) - 1
             if 0 <= c_idx < len(history):
-                for ch in history[c_idx]:
+                chs = history[c_idx]["channels"]
+                for ch in chs:
                     append_unique(ch)
-                names = ", ".join(ch["name"] for ch in history[c_idx])
+                names = ", ".join(ch["name"] for ch in chs)
                 print(f" ⚡ [{tok}] 불러오기 -> {names}")
                 continue
             print(f" ❌ [{tok}]번 기록이 없습니다.")
             return None
 
         is_pair = len(tok) == 2 and tok.isdigit() and tok[0] != "0" and tok[1] != "0"
-        is_dash_pair = len(tok) == 3 and tok[1] == "-" and tok[0] in "123456789" and tok[2] in "123456789"
-        if history and (is_pair or is_dash_pair):
+        dash_m = re.match(r"^([1-9])-(\d+)$", tok)
+        if history and (is_pair or dash_m):
             c_idx = int(tok[0]) - 1
-            s_idx = int(tok[-1]) - 1
-            if 0 <= c_idx < len(history) and 0 <= s_idx < len(history[c_idx]):
-                ch = history[c_idx][s_idx]
+            s_idx = (int(dash_m.group(2)) if dash_m else int(tok[-1])) - 1
+            if 0 <= c_idx < len(history) and 0 <= s_idx < len(history[c_idx]["channels"]):
+                ch = history[c_idx]["channels"][s_idx]
                 append_unique(ch)
                 print(f" ⚡ [{tok}] 불러오기 -> {ch['name']}")
                 continue
@@ -4077,7 +7617,7 @@ def run_cookie_manager():
 def main():
     global INITIAL_CHANNELS
     print("==================================================")
-    print(f" 🎬 치지직 실시간 채팅 멀티뷰 ({APP_VERSION} · 최대 6개)")
+    print(f" 🎬 치지직 실시간 채팅 멀티뷰 ({APP_VERSION})")
     print("==================================================")
 
     auto_update_if_needed()
@@ -4094,7 +7634,7 @@ def main():
             print("   • 엔터만 누르면 직전 기록 [1] 바로 실행")
             print()
             print(" [빠른 입력]  1 = 1번 전체   12 = 1번의 2번째 스트리머")
-            print("              d1 = 1번 삭제  n = 빈 화면  c = 쿠키  v = 버전")
+            print("              p1 = 1번 고정  d1 = 1번 삭제  n = 빈 화면  c = 쿠키  v = 버전")
         else:
             print("   • 엔터만 누르면 빈 화면으로 시작해 웹에서 검색 가능")
             print("   • c = 쿠키 설정   v = GitHub 버전 선택/업데이트")
@@ -4116,12 +7656,24 @@ def main():
             run_cookie_manager()
             continue
 
+        if history and user_input.lower().startswith("p") and user_input[1:].strip().isdigit():
+            pin_idx = int(user_input[1:].strip()) - 1
+            if 0 <= pin_idx < len(history):
+                target_names = ", ".join(ch["name"] for ch in history[pin_idx]["channels"])
+                was_pinned = history[pin_idx]["pinned"]
+                toggle_history_pin(pin_idx)
+                state_txt = "고정 해제" if was_pinned else "📌 고정"
+                print(f"\n {state_txt} 완료: {target_names}\n")
+            else:
+                print(f"\n ❌ 1 ~ {len(history)} 사이의 번호만 고정할 수 있습니다.\n")
+            continue
+
         if history and user_input.lower().startswith("d") and user_input[1:].strip().isdigit():
             del_idx = int(user_input[1:].strip()) - 1
             if 0 <= del_idx < len(history):
                 removed = history.pop(del_idx)
                 save_history(history)
-                removed_names = ", ".join(ch["name"] for ch in removed)
+                removed_names = ", ".join(ch["name"] for ch in removed["channels"])
                 print(f"\n 🗑 [{del_idx + 1}] 기록을 삭제했습니다: {removed_names}\n")
             else:
                 print(f"\n ❌ 1 ~ {len(history)} 사이의 번호만 삭제할 수 있습니다.\n")
@@ -4129,7 +7681,7 @@ def main():
 
         if user_input == "":
             if history:
-                INITIAL_CHANNELS = list(history[0])
+                INITIAL_CHANNELS = list(history[0]["channels"])
                 names = ", ".join(ch["name"] for ch in INITIAL_CHANNELS)
                 print(f"\n ⚡ 최근 기록 [1] 실행: {names}")
             else:
